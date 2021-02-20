@@ -1,9 +1,12 @@
 package com.linkedin.venice.hadoop;
 
+import com.linkedin.venice.exceptions.TopicAuthorizationVeniceException;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.serialization.avro.VeniceAvroKafkaSerializer;
 import com.linkedin.venice.writer.AbstractVeniceWriter;
+import java.util.List;
 import org.apache.hadoop.io.BytesWritable;
+import org.apache.hadoop.io.NullWritable;
 import org.apache.hadoop.mapred.OutputCollector;
 import org.apache.hadoop.mapred.Reporter;
 import org.apache.kafka.clients.producer.Callback;
@@ -22,7 +25,7 @@ import static org.mockito.Mockito.*;
 public class TestVeniceReducer extends AbstractTestVeniceMR {
 
   @Test
-  public void testReduce() throws IOException {
+  public void testReduce() {
     AbstractVeniceWriter mockWriter = mock(AbstractVeniceWriter.class);
     VeniceReducer reducer = new VeniceReducer();
     reducer.setVeniceWriter(mockWriter);
@@ -31,7 +34,7 @@ public class TestVeniceReducer extends AbstractTestVeniceMR {
     final String valueFieldValue = "test_value";
     BytesWritable keyWritable = new BytesWritable(keyFieldValue.getBytes());
     BytesWritable valueWritable = new BytesWritable(valueFieldValue.getBytes());
-    ArrayList<BytesWritable> values = new ArrayList();
+    List<BytesWritable> values = new ArrayList<>();
     values.add(valueWritable);
     OutputCollector mockCollector = mock(OutputCollector.class);
     Reporter mockReporter = mock(Reporter.class);
@@ -53,14 +56,14 @@ public class TestVeniceReducer extends AbstractTestVeniceMR {
   }
 
   @Test (expectedExceptions = VeniceException.class)
-  public void testReduceWithNoValue() throws IOException {
+  public void testReduceWithNoValue() {
     AbstractVeniceWriter mockWriter = mock(AbstractVeniceWriter.class);
     VeniceReducer reducer = new VeniceReducer();
     reducer.setVeniceWriter(mockWriter);
     reducer.configure(setupJobConf());
     final String keyFieldValue = "test_key";
     BytesWritable keyWritable = new BytesWritable(keyFieldValue.getBytes());
-    ArrayList<BytesWritable> values = new ArrayList();
+    List<BytesWritable> values = new ArrayList<>();
     OutputCollector mockCollector = mock(OutputCollector.class);
     Reporter mockReporter = mock(Reporter.class);
 
@@ -68,21 +71,24 @@ public class TestVeniceReducer extends AbstractTestVeniceMR {
   }
 
   @Test
-  public void testReduceWithMultipleValues() throws IOException {
-    //duplicate key with same value should not fail
-    testDuplicateKey(true);
-
-
-    try {
-      testDuplicateKey(false);
-      Assert.fail();
-    } catch (VeniceException e) {
-      Assert.assertEquals(e.getMessage(), "There are multiple records for key:\n" +
-      "\"test_key\"");
-    }
+  public void testReduceWithMultipleSameValues() {
+    Reporter mockReporter = mock(Reporter.class);
+    // Duplicate key with same values should not fail
+    testDuplicateKey(true,mockReporter);
+    verify(mockReporter, never()).incrCounter(eq(COUNTER_GROUP_DATA_QUALITY), eq(DUPLICATE_KEY_WITH_DISTINCT_VALUE), anyLong());
+    verify(mockReporter, times(1)).incrCounter(eq(COUNTER_GROUP_DATA_QUALITY), eq(DUPLICATE_KEY_WITH_IDENTICAL_VALUE), eq(1L));
   }
 
-  private void testDuplicateKey(boolean sameValue) throws IOException{
+  @Test
+  public void testReduceWithMultipleDistinctValues() {
+    Reporter mockReporter = mock(Reporter.class);
+    // Duplicate key with distinct values should not fail
+    testDuplicateKey(false, mockReporter);
+    verify(mockReporter, times(1)).incrCounter(eq(COUNTER_GROUP_DATA_QUALITY), eq(DUPLICATE_KEY_WITH_DISTINCT_VALUE), eq(1L));
+    verify(mockReporter, never()).incrCounter(eq(COUNTER_GROUP_DATA_QUALITY), eq(DUPLICATE_KEY_WITH_IDENTICAL_VALUE), anyLong());
+  }
+
+  private void testDuplicateKey(boolean sameValue, Reporter reporter) {
     AbstractVeniceWriter mockWriter = mock(AbstractVeniceWriter.class);
     VeniceReducer reducer = new VeniceReducer();
     reducer.setVeniceWriter(mockWriter);
@@ -99,13 +105,33 @@ public class TestVeniceReducer extends AbstractTestVeniceMR {
     values.add(sameValue ? new BytesWritable("test_value".getBytes()) :
         new BytesWritable("test_value1".getBytes()));
     OutputCollector mockCollector = mock(OutputCollector.class);
-    Reporter mockReporter = mock(Reporter.class);
-
-    reducer.reduce(keyWritable, values.iterator(), mockCollector, mockReporter);
+    reducer.reduce(keyWritable, values.iterator(), mockCollector, reporter);
   }
 
   @Test
-  public void testReduceWithDifferentReporters() throws IOException {
+  public void testReduceWithTopicAuthorizationException() throws IOException {
+    AbstractVeniceWriter mockVeniceWriter = mock(AbstractVeniceWriter.class);
+    when(mockVeniceWriter.put(any(), any(), anyInt(), any())).thenThrow(new TopicAuthorizationVeniceException("No ACL permission"));
+    VeniceReducer reducer = new VeniceReducer();
+    reducer.setVeniceWriter(mockVeniceWriter);
+    reducer.configure(setupJobConf());
+
+    // One key and one value
+    byte[] keyBytes = new VeniceAvroKafkaSerializer("\"string\"").serialize("test_topic", "test_key");
+    BytesWritable keyWritable = new BytesWritable(keyBytes);
+    ArrayList<BytesWritable> values = new ArrayList<>();
+    values.add(new BytesWritable("test_value".getBytes()));
+    Reporter mockReporter = mock(Reporter.class);
+    OutputCollector mockCollector = mock(OutputCollector.class);
+    reducer.reduce(keyWritable, values.iterator(), mockCollector, mockReporter);
+
+    // Expect the counter to record this authorization error
+    verify(mockReporter, times(1)).incrCounter(eq(COUNTER_GROUP_KAFKA), eq(AUTHORIZATION_FAILURES), eq(1L));
+    verify(mockCollector, never()).collect(any(), any());
+  }
+
+  @Test
+  public void testReduceWithDifferentReporters() {
     AbstractVeniceWriter mockWriter = mock(AbstractVeniceWriter.class);
     VeniceReducer reducer = new VeniceReducer();
     reducer.setVeniceWriter(mockWriter);
@@ -114,7 +140,7 @@ public class TestVeniceReducer extends AbstractTestVeniceMR {
     final String valueFieldValue = "test_value";
     BytesWritable keyWritable = new BytesWritable(keyFieldValue.getBytes());
     BytesWritable valueWritable = new BytesWritable(valueFieldValue.getBytes());
-    ArrayList<BytesWritable> values = new ArrayList();
+    List<BytesWritable> values = new ArrayList<>();
     values.add(valueWritable);
     OutputCollector mockCollector = mock(OutputCollector.class);
     Reporter mockReporter = mock(Reporter.class);
@@ -134,10 +160,10 @@ public class TestVeniceReducer extends AbstractTestVeniceMR {
   }
 
   @Test (expectedExceptions = VeniceException.class, expectedExceptionsMessageRegExp = "KafkaPushJob failed with exception.*")
-  public void testReduceWithWriterException() throws IOException {
+  public void testReduceWithWriterException() {
     AbstractVeniceWriter exceptionWriter = new AbstractVeniceWriter(TOPIC_NAME) {
       @Override
-      public void close(boolean shouldEndAllSegments) throws IOException {
+      public void close(boolean shouldEndAllSegments) {
         // no-op
       }
 
@@ -160,7 +186,7 @@ public class TestVeniceReducer extends AbstractTestVeniceMR {
       }
 
       @Override
-      public void close() throws IOException {
+      public void close() {
         // no-op
       }
     };
@@ -172,7 +198,7 @@ public class TestVeniceReducer extends AbstractTestVeniceMR {
     final String valueFieldValue = "test_value";
     BytesWritable keyWritable = new BytesWritable(keyFieldValue.getBytes());
     BytesWritable valueWritable = new BytesWritable(valueFieldValue.getBytes());
-    ArrayList<BytesWritable> values = new ArrayList();
+    List<BytesWritable> values = new ArrayList<>();
     values.add(valueWritable);
     OutputCollector mockCollector = mock(OutputCollector.class);
     Reporter mockReporter = mock(Reporter.class);
@@ -220,7 +246,7 @@ public class TestVeniceReducer extends AbstractTestVeniceMR {
     final String valueFieldValue = "test_value";
     BytesWritable keyWritable = new BytesWritable(keyFieldValue.getBytes());
     BytesWritable valueWritable = new BytesWritable(valueFieldValue.getBytes());
-    ArrayList<BytesWritable> values = new ArrayList();
+    List<BytesWritable> values = new ArrayList<>();
     values.add(valueWritable);
     OutputCollector mockCollector = mock(OutputCollector.class);
     Reporter mockReporter = mock(Reporter.class);

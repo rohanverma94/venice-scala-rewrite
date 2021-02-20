@@ -4,6 +4,7 @@ import com.github.luben.zstd.Zstd;
 import com.linkedin.venice.compression.CompressionStrategy;
 import com.linkedin.venice.compression.CompressorFactory;
 import com.linkedin.venice.compression.VeniceCompressor;
+import com.linkedin.venice.exceptions.TopicAuthorizationVeniceException;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.hadoop.ssl.SSLConfigurator;
 import com.linkedin.venice.hadoop.ssl.UserCredentialsFactory;
@@ -73,7 +74,16 @@ public abstract class AbstractVeniceMapper<INPUT_KEY, INPUT_VALUE>
     }
 
     if (isMapperOnly) {
-      reducer.sendMessageToKafka(recordKey, recordValue, reporter);
+      try {
+        reducer.sendMessageToKafka(recordKey, recordValue, reporter);
+      } catch (VeniceException e) {
+        if (e instanceof TopicAuthorizationVeniceException && reporter != null) {
+          reporter.incrCounter(COUNTER_GROUP_KAFKA, AUTHORIZATION_FAILURES, 1);
+          LOGGER.error(e);
+          return;
+        }
+        throw e;
+      }
       return;
     }
 

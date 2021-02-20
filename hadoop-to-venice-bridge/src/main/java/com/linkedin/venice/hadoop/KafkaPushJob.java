@@ -551,7 +551,7 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
         // Create new store version, topic and fetch Kafka url from backend
         createNewStoreVersion(pushJobSetting, inputFileDataSize, controllerClient, pushId, props, optionalCompressionDictionary);
         updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.NEW_VERSION_CREATED);
-        // Update and send push job details with new info
+        // Update and send push job details with new info to the controller
         pushJobDetails.pushId = pushId;
         pushJobDetails.partitionCount = versionTopicInfo.partitionCount;
         pushJobDetails.valueCompressionStrategy = versionTopicInfo.compressionStrategy.getValue();
@@ -565,7 +565,7 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
         // If reducer phase is enabled, each reducer will sort all the messages inside one single
         // topic partition.
         setupMRConf(jobConf, versionTopicInfo, pushJobSetting, schemaInfo, storeSetting, props, id, inputDirectory);
-
+        boolean jobSucceeded;
         if (pushJobSetting.isIncrementalPush) {
           /**
            * N.B.: For now, we always send control messages directly for incremental pushes, regardless of
@@ -577,8 +577,12 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
           getVeniceWriter(versionTopicInfo).broadcastStartOfIncrementalPush(pushJobSetting.incrementalPushVersion.get(), new HashMap<>());
           updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.START_MAP_REDUCE_JOB);
           runningJob = JobClient.runJob(jobConf);
-          updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.MAP_REDUCE_JOB_COMPLETED);
-          getVeniceWriter(versionTopicInfo).broadcastEndOfIncrementalPush(pushJobSetting.incrementalPushVersion.get(), new HashMap<>());
+          jobSucceeded = updatePushJobDetailsWithMRDetails();
+          if (jobSucceeded) {
+            updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.MAP_REDUCE_JOB_COMPLETED);
+            getVeniceWriter(versionTopicInfo)
+                .broadcastEndOfIncrementalPush(pushJobSetting.incrementalPushVersion.get(), Collections.emptyMap());
+          }
         } else {
           if (pushJobSetting.sendControlMessagesDirectly) {
             getVeniceWriter(versionTopicInfo).broadcastStartOfPush(
@@ -596,11 +600,14 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
           }
           updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.START_MAP_REDUCE_JOB);
           runningJob = JobClient.runJob(jobConf);
-          updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.MAP_REDUCE_JOB_COMPLETED);
-          if (pushJobSetting.sendControlMessagesDirectly) {
-            getVeniceWriter(versionTopicInfo).broadcastEndOfPush(new HashMap<>());
-          } else {
-            controllerClient.writeEndOfPush(pushJobSetting.storeName, versionTopicInfo.version);
+          jobSucceeded = updatePushJobDetailsWithMRDetails();
+          if (jobSucceeded) {
+            updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.MAP_REDUCE_JOB_COMPLETED);
+            if (pushJobSetting.sendControlMessagesDirectly) {
+              getVeniceWriter(versionTopicInfo).broadcastEndOfPush(Collections.emptyMap());
+            } else {
+              controllerClient.writeEndOfPush(pushJobSetting.storeName, versionTopicInfo.version);
+            }
           }
         }
         // Close VeniceWriter before polling job status since polling job status could
@@ -608,30 +615,19 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
         closeVeniceWriter();
         // Update and send push job details with new info
         updatePushJobDetailsWithMRCounters();
-        pushJobDetails.overallStatus.add(getPushJobDetailsStatusTuple(PushJobDetailsStatus.WRITE_COMPLETED.getValue()));
-        sendPushJobDetailsToController();
-        // Waiting for Venice Backend to complete consumption
-        updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.START_JOB_STATUS_POLLING);
-        pollStatusUntilComplete(pushJobSetting.incrementalPushVersion, controllerClient, pushJobSetting, versionTopicInfo);
-        updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.JOB_STATUS_POLLING_COMPLETED);
-        pushJobDetails.overallStatus.add(getPushJobDetailsStatusTuple(PushJobDetailsStatus.COMPLETED.getValue()));
-        pushJobDetails.jobDurationInMs = System.currentTimeMillis() - jobStartTimeMs;
-        updatePushJobDetailsWithConfigs();
-        sendPushJobDetailsToController();
-
-        // delete outdated incremental push status
-        // TODO(xnma): if KafkaPushJob might hang forever, incremental push status wont get purged.
-        // Design and implement a better scenario when Da Vinci have incremental push use cases.
-        if (pushJobSetting.isIncrementalPush && versionTopicInfo.daVinciPushStatusStoreEnabled) {
-          try (PushStatusStoreRecordDeleter pushStatusStoreDeleter =
-              new PushStatusStoreRecordDeleter(new VeniceWriterFactory(getVeniceWriterProperties(versionTopicInfo)))) {
-            pushStatusStoreDeleter.deletePushStatus(
-                pushJobSetting.storeName,
-                versionTopicInfo.version,
-                pushJobSetting.incrementalPushVersion, versionTopicInfo.partitionCount
-            );
-          }
+        if (jobSucceeded) {
+          pushJobDetails.overallStatus.add(getPushJobDetailsStatusTuple(PushJobDetailsStatus.WRITE_COMPLETED.getValue()));
+          sendPushJobDetailsToController();
+          // Waiting for Venice Backend to complete consumption
+          updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.START_JOB_STATUS_POLLING);
+          pollStatusUntilComplete(pushJobSetting.incrementalPushVersion, controllerClient, pushJobSetting, versionTopicInfo);
+          updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.JOB_STATUS_POLLING_COMPLETED);
+          pushJobDetails.overallStatus.add(getPushJobDetailsStatusTuple(PushJobDetailsStatus.COMPLETED.getValue()));
+          pushJobDetails.jobDurationInMs = System.currentTimeMillis() - jobStartTimeMs;
+          updatePushJobDetailsWithConfigs();
         }
+        sendPushJobDetailsToController();
+        deleteOutdatedIncrementalPushStatusIfNeeded();
       }
 
       if (pushJobSetting.enablePBNJ) {
@@ -647,9 +643,6 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
         pushJobDetails.failureDetails = e.toString();
         pushJobDetails.jobDurationInMs = System.currentTimeMillis() - jobStartTimeMs;
         updatePushJobDetailsWithConfigs();
-        if (pushJobDetails.pushJobLatestCheckpoint == PushJobCheckpoints.START_MAP_REDUCE_JOB.getValue()) {
-          updatePushJobDetailsWithMRDetails();
-        }
         sendPushJobDetailsToController();
         closeVeniceWriter();
       } catch (Exception ex) {
@@ -678,6 +671,22 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
       LOGGER.info("No compression dictionary is generated with the strategy " + storeSetting.compressionStrategy);
     }
     return Optional.ofNullable(compressionDictionary);
+  }
+
+  private void deleteOutdatedIncrementalPushStatusIfNeeded() {
+    // delete outdated incremental push status
+    // TODO(xnma): if KafkaPushJob might hang forever, incremental push status wont get purged.
+    // Design and implement a better scenario when Da Vinci have incremental push use cases.
+    if (pushJobSetting.isIncrementalPush && versionTopicInfo.daVinciPushStatusStoreEnabled) {
+      try (PushStatusStoreRecordDeleter pushStatusStoreDeleter =
+          new PushStatusStoreRecordDeleter(new VeniceWriterFactory(getVeniceWriterProperties(versionTopicInfo)))) {
+        pushStatusStoreDeleter.deletePushStatus(
+            pushJobSetting.storeName,
+            versionTopicInfo.version,
+            pushJobSetting.incrementalPushVersion, versionTopicInfo.partitionCount
+        );
+      }
+    }
   }
 
   private void shutdownHdfsExecutorService() {
@@ -858,20 +867,22 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
 
   /**
    * Best effort attempt to get more details on reasons behind MR failure by looking at MR counters
+   *
+   * @return false if MR details indicate any MR job error and vice versa
    */
-  private void updatePushJobDetailsWithMRDetails() {
+  private boolean updatePushJobDetailsWithMRDetails() {
     try {
       // Quota exceeded
       long inputFileSize = getCounter(COUNTER_GROUP_QUOTA, COUNTER_TOTAL_KEY_SIZE) + getCounter(COUNTER_GROUP_QUOTA, COUNTER_TOTAL_VALUE_SIZE);
       long veniceDiskUsageEstimate = (long) (inputFileSize / storeSetting.storageEngineOverheadRatio);
       if (veniceDiskUsageEstimate > storeSetting.storeStorageQuota) {
         updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.QUOTA_EXCEEDED);
-        return;
+        return false;
       }
       // Write ACL failed
       if (getCounter(COUNTER_GROUP_KAFKA, AUTHORIZATION_FAILURES) > 0) {
         updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.WRITE_ACL_FAILED);
-        return;
+        return false;
       }
       // Duplicate keys
       if (!pushJobSetting.isDuplicateKeyAllowed &&
@@ -882,6 +893,7 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
       LOGGER.info("Exception caught while trying to get more details on MR failure, reporting without it. "
           + NON_CRITICAL_EXCEPTION, e);
     }
+    return true;
   }
 
   private long getCounter(String groupName, String counterName) throws IOException {

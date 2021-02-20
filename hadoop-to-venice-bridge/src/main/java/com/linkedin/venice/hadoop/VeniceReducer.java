@@ -3,6 +3,7 @@ package com.linkedin.venice.hadoop;
 import com.linkedin.avroutil1.compatibility.AvroCompatibilityHelper;
 import com.linkedin.venice.ConfigKeys;
 import com.linkedin.venice.exceptions.QuotaExceededException;
+import com.linkedin.venice.exceptions.TopicAuthorizationVeniceException;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.guid.GuidUtils;
 import com.linkedin.venice.hadoop.ssl.SSLConfigurator;
@@ -136,8 +137,16 @@ public class VeniceReducer implements Reducer<BytesWritable, BytesWritable, Null
     }
     byte[] valueBytes = values.next().copyBytes();
 
-    sendMessageToKafka(keyBytes, valueBytes, reporter);
-
+    try {
+      sendMessageToKafka(keyBytes, valueBytes, reporter);
+    } catch (VeniceException e) {
+      if (e instanceof TopicAuthorizationVeniceException) {
+        reporter.incrCounter(COUNTER_GROUP_KAFKA, AUTHORIZATION_FAILURES, 1);
+        LOGGER.error(e);
+        return;
+      }
+      throw e;
+    }
     if (checkDupKey) {
       duplicateKeyPrinter.detectAndHandleDuplicateKeys(keyBytes, valueBytes, values, reporter);
     }
@@ -154,18 +163,10 @@ public class VeniceReducer implements Reducer<BytesWritable, BytesWritable, Null
       callback = new KafkaMessageCallback(reporter);
       previousReporter = reporter;
     }
-
-    try {
-      if (enableWriteCompute && derivedValueSchemaId > 0) {
-        veniceWriter.update(keyBytes, valueBytes, valueSchemaId, derivedValueSchemaId, callback);
-      } else {
-        veniceWriter.put(keyBytes, valueBytes, valueSchemaId, callback);
-      }
-    } catch (VeniceException e) {
-      if (e.getMessage().contains("do not have permission to write")) {
-        reporter.incrCounter(COUNTER_GROUP_KAFKA, AUTHORIZATION_FAILURES, 1);
-      }
-      throw e;
+    if (enableWriteCompute && derivedValueSchemaId > 0) {
+      veniceWriter.update(keyBytes, valueBytes, valueSchemaId, derivedValueSchemaId, callback);
+    } else {
+      veniceWriter.put(keyBytes, valueBytes, valueSchemaId, callback);
     }
     messageSent++;
     telemetry();
@@ -491,26 +492,35 @@ public class VeniceReducer implements Reducer<BytesWritable, BytesWritable, Null
         return;
       }
       boolean shouldPrint = true; // In case there are lots of duplicate keys with the same value, only print once.
+      int distinctValuesToKeyCount = 0;
+      int identicalValuesToKeyCount = 0;
+
       while (values.hasNext()) {
         if (Arrays.equals(values.next().copyBytes(), valueBytes)) {
           // Identical values map to the same key. E.g. key:[ value_1, value_1]
-          reporter.incrCounter(COUNTER_GROUP_DATA_QUALITY, DUPLICATE_KEY_WITH_IDENTICAL_VALUE, 1);
+          identicalValuesToKeyCount++;
           if (shouldPrint) {
             shouldPrint = false;
             LOGGER.warn(printDuplicateKey(keyBytes));
           }
         } else {
           // Distinct values map to the same key. E.g. key:[ value_1, value_2 ]
-          reporter.incrCounter(COUNTER_GROUP_DATA_QUALITY, DUPLICATE_KEY_WITH_DISTINCT_VALUE, 1);
+          distinctValuesToKeyCount++;
+
           if (isDupKeyAllowed) {
             if (shouldPrint) {
               shouldPrint = false;
               LOGGER.warn(printDuplicateKey(keyBytes));
             }
-          } else {
-            throw new VeniceException(printDuplicateKey(keyBytes));
           }
         }
+      }
+
+      if (identicalValuesToKeyCount > 0) {
+        reporter.incrCounter(COUNTER_GROUP_DATA_QUALITY, DUPLICATE_KEY_WITH_IDENTICAL_VALUE, identicalValuesToKeyCount);
+      }
+      if (distinctValuesToKeyCount > 0) {
+        reporter.incrCounter(COUNTER_GROUP_DATA_QUALITY, DUPLICATE_KEY_WITH_DISTINCT_VALUE, distinctValuesToKeyCount);
       }
     }
 
