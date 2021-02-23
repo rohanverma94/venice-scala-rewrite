@@ -1,6 +1,11 @@
 package com.linkedin.venice.hadoop;
 
 import com.linkedin.venice.controllerapi.ControllerClient;
+import com.linkedin.venice.controllerapi.ControllerResponse;
+import com.linkedin.venice.controllerapi.D2ServiceDiscoveryResponse;
+import com.linkedin.venice.controllerapi.StorageEngineOverheadRatioResponse;
+import com.linkedin.venice.controllerapi.StoreResponse;
+import com.linkedin.venice.meta.StoreInfo;
 import com.linkedin.venice.writer.VeniceWriter;
 import java.io.IOException;
 import java.util.Properties;
@@ -41,11 +46,28 @@ public class TestKafkaPushJobWithReporterCounters {
 
   private ControllerClient createClusterDiscoveryControllerClientMock() {
     ControllerClient controllerClient = mock(ControllerClient.class);
+    D2ServiceDiscoveryResponse controllerResponse = mock(D2ServiceDiscoveryResponse.class);
+    when(controllerResponse.getCluster()).thenReturn("mock-cluster-name");
+    when(controllerClient.discoverCluster(anyString())).thenReturn(controllerResponse);
     return controllerClient;
   }
 
   private ControllerClient createControllerClientMock() {
     ControllerClient controllerClient = mock(ControllerClient.class);
+    StoreResponse storeResponse = mock(StoreResponse.class);
+    StoreInfo storeInfo = mock(StoreInfo.class);
+
+    StorageEngineOverheadRatioResponse storageEngineOverheadRatioResponse = mock(StorageEngineOverheadRatioResponse.class);
+    when(storageEngineOverheadRatioResponse.isError()).thenReturn(false);
+    when(storageEngineOverheadRatioResponse.getStorageEngineOverheadRatio()).thenReturn(1.0);
+
+    when(storeInfo.getStorageQuotaInByte()).thenReturn(1000L);
+    when(storeInfo.isSchemaAutoRegisterFromPushJobEnabled()).thenReturn(false);
+    when(storeResponse.getStore()).thenReturn(storeInfo);
+
+    when(controllerClient.getStore(anyString())).thenReturn(storeResponse);
+    when(controllerClient.getStorageEngineOverheadRatio(anyString())).thenReturn(storageEngineOverheadRatioResponse);
+
     return controllerClient;
   }
 

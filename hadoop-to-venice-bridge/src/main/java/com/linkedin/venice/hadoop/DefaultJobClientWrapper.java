@@ -6,7 +6,7 @@ import org.apache.hadoop.mapred.JobConf;
 import org.apache.hadoop.mapred.RunningJob;
 
 
-public class JobClientWrapperImpl implements JobClientWrapper {
+public class DefaultJobClientWrapper implements JobClientWrapper {
 
   @Override
   public RunningJob runJobWithConfig(JobConf jobConf) throws IOException {

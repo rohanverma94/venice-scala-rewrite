@@ -12,8 +12,6 @@ import com.linkedin.venice.controllerapi.StoreResponse;
 import com.linkedin.venice.controllerapi.VersionCreationResponse;
 import com.linkedin.venice.etl.ETLValueSchemaTransformation;
 import com.linkedin.venice.exceptions.VeniceException;
-import com.linkedin.venice.hadoop.exceptions.VeniceInconsistentSchemaException;
-import com.linkedin.venice.hadoop.exceptions.VeniceSchemaFieldNotFoundException;
 import com.linkedin.venice.hadoop.pbnj.PostBulkLoadAnalysisMapper;
 import com.linkedin.venice.hadoop.ssl.SSLConfigurator;
 import com.linkedin.venice.hadoop.ssl.TempFileSSLConfigurator;
@@ -25,8 +23,6 @@ import com.linkedin.venice.partitioner.DefaultVenicePartitioner;
 import com.linkedin.venice.partitioner.VenicePartitioner;
 import com.linkedin.venice.pushmonitor.ExecutionStatus;
 import com.linkedin.venice.pushstatus.PushStatusStoreRecordDeleter;
-import com.linkedin.venice.schema.vson.VsonAvroSchemaAdapter;
-import com.linkedin.venice.schema.vson.VsonSchema;
 import com.linkedin.venice.security.SSLFactory;
 import com.linkedin.venice.serialization.avro.AvroProtocolDefinition;
 import com.linkedin.venice.serialization.avro.InternalAvroSpecificSerializer;
@@ -62,11 +58,9 @@ import org.apache.hadoop.fs.PathFilter;
 import org.apache.hadoop.io.BytesWritable;
 import org.apache.hadoop.io.NullWritable;
 import org.apache.hadoop.mapred.FileInputFormat;
-import org.apache.hadoop.mapred.JobClient;
 import org.apache.hadoop.mapred.JobConf;
 import org.apache.hadoop.mapred.RunningJob;
 import org.apache.hadoop.mapred.lib.NullOutputFormat;
-import org.apache.hadoop.yarn.webapp.Controller;
 import org.apache.kafka.clients.CommonClientConfigs;
 import org.apache.log4j.Logger;
 import java.io.IOException;
@@ -82,12 +76,9 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.function.Consumer;
 
 import static com.linkedin.venice.CommonConfigKeys.*;
 import static com.linkedin.venice.ConfigKeys.*;
@@ -167,9 +158,7 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
   public static final String DERIVED_SCHEMA_ID_PROP = "derived.schema.id";
   public static final String KAFKA_URL_PROP = "venice.kafka.url";
   public static final String TOPIC_PROP = "venice.kafka.topic";
-
   protected static final String HADOOP_PREFIX = "hadoop-conf.";
-
   protected static final String SSL_PREFIX = "ssl";
 
   // PBNJ-related configs are all optional
@@ -184,8 +173,6 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
   public static final String VSON_PUSH = "vson.push";
   public static final String KAFKA_SECURITY_PROTOCOL = "SSL";
   public static final String COMPRESSION_STRATEGY = "compression.strategy";
-  public static final String COMPRESSION_DICTIONARY_SAMPLE_SIZE = "compression.dictionary.sample.size";
-  public static final String COMPRESSION_DICTIONARY_SIZE_LIMIT = "compression.dictionary.size.limit";
   public static final String SSL_CONFIGURATOR_CLASS_CONFIG = "ssl.configurator.class";
   public static final String SSL_KEY_STORE_PROPERTY_NAME = "ssl.key.store.property.name";
   public static final String SSL_TRUST_STORE_PROPERTY_NAME = "ssl.trust.store.property.name";
@@ -286,6 +273,7 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
   private JobClientWrapper jobClientWrapper;
   // A controller client that is used to discover cluster
   private ControllerClient clusterDiscoveryControllerClient;
+  private InputDataInfoProvider inputDataInfoProvider;
 
   protected static class SchemaInfo {
     boolean isAvro = true;
@@ -515,6 +503,11 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
     this.clusterDiscoveryControllerClient = clusterDiscoveryControllerClient;
   }
 
+  @VisibleForTesting
+  protected void setInputDataInfoProvider(InputDataInfoProvider inputDataInfoProvider) {
+    this.inputDataInfoProvider = inputDataInfoProvider;
+  }
+
   /**
    * Do not change this method argument type.
    * Used by Azkaban
@@ -554,10 +547,11 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
 
       // Check data size
       // TODO: do we actually need this information?
-      Pair<SchemaInfo, Long> inputInfoPair = validateInputAndGetSchema(this.inputDirectory, this.props);
+      InputDataInfoProvider.InputDataInfo inputInfo =
+          getInputDataInfoProvider().validateInputAndGetSchema(this.inputDirectory, this.props);
       // Get input schema
-      schemaInfo = inputInfoPair.getFirst();
-      inputFileDataSize = inputInfoPair.getSecond();
+      schemaInfo = inputInfo.getSchemaInfo();
+      inputFileDataSize = inputInfo.getInputFileDataSizeInBytes();
       validateKeySchema(controllerClient, pushJobSetting, schemaInfo);
       validateValueSchema(controllerClient, pushJobSetting, schemaInfo, storeSetting.isSchemaAutoRegisteFromPushJobEnabled);
 
@@ -692,9 +686,16 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
 
   private RunningJob runJobWithConfig(JobConf jobConf) throws IOException {
     if (jobClientWrapper == null) {
-      jobClientWrapper = new JobClientWrapperImpl();
+      jobClientWrapper = new DefaultJobClientWrapper();
     }
     return jobClientWrapper.runJobWithConfig(jobConf);
+  }
+
+  private InputDataInfoProvider getInputDataInfoProvider() {
+    if (inputDataInfoProvider == null) {
+      inputDataInfoProvider = new DefaultInputDataInfoProvider(storeSetting, pushJobSetting, zstdConfig, props, hdfsExecutorService);
+    }
+    return inputDataInfoProvider;
   }
 
   /**
@@ -779,81 +780,6 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
     String uri = props.getString(INPUT_PATH_PROP);
     Path sourcePath = getLatestPathOfInputDirectory(uri, fs);
     return sourcePath.toString();
-  }
-
-  /**
-   * 1. Check whether it's Vson input or Avro input
-   * 2. Check schema consistency;
-   * 3. Populate key schema, value schema;
-   * 4. Load samples for dictionary compression if enabled
-   * @param inputUri
-   * @param props push job properties
-   * @return a pair containing schema related information and input file size
-   * @throws Exception
-   */
-  protected Pair<SchemaInfo, Long> validateInputAndGetSchema(String inputUri, VeniceProperties props) throws Exception {
-    Configuration conf = new Configuration();
-    FileSystem fs = FileSystem.get(conf);
-    Path srcPath = new Path(inputUri);
-    FileStatus[] fileStatuses = fs.listStatus(srcPath, PATH_FILTER);
-
-    if (fileStatuses == null || fileStatuses.length == 0) {
-      throw new RuntimeException("No data found at source path: " + srcPath);
-    }
-
-    if (this.storeSetting.compressionStrategy == CompressionStrategy.ZSTD_WITH_DICT) {
-      LOGGER.info("Zstd compression enabled for " + pushJobSetting.storeName);
-      initZstdConfig(fileStatuses.length);
-    }
-
-    SchemaInfo schemaInfo = new SchemaInfo();
-    //try reading the file via sequence file reader. It indicates Vson input if it is succeeded.
-    Map<String, String> fileMetadata = getMetadataFromSequenceFile(fs, fileStatuses[0].getPath(), false);
-    if (fileMetadata.containsKey(FILE_KEY_SCHEMA) && fileMetadata.containsKey(FILE_VALUE_SCHEMA)) {
-      schemaInfo.isAvro = false;
-      schemaInfo.vsonFileKeySchema = fileMetadata.get(FILE_KEY_SCHEMA);
-      schemaInfo.vsonFileValueSchema = fileMetadata.get(FILE_VALUE_SCHEMA);
-    }
-    // Check the first file type prior to check schema consistency to make sure a schema can be obtained from it.
-    if (fileStatuses[0].isDirectory()) {
-      throw new VeniceException("Input directory: " + fileStatuses[0].getPath().getParent().getName() +
-          " should not have sub directory: " + fileStatuses[0].getPath().getName());
-    }
-
-    final AtomicLong inputFileDataSize = new AtomicLong(0);
-    if (schemaInfo.isAvro) {
-      LOGGER.info("Detected Avro input format.");
-      schemaInfo.keyField = props.getString(KEY_FIELD_PROP);
-      schemaInfo.valueField = props.getString(VALUE_FIELD_PROP);
-
-      Pair<Schema, Schema> avroSchema = checkAvroSchemaConsistency(fs, fileStatuses, inputFileDataSize);
-
-      Schema fileSchema = avroSchema.getFirst();
-      Schema storeSchema = avroSchema.getSecond();
-
-      schemaInfo.fileSchemaString = fileSchema.toString();
-      schemaInfo.keySchemaString = extractAvroSubSchema(storeSchema, schemaInfo.keyField).toString();
-      schemaInfo.valueSchemaString = extractAvroSubSchema(storeSchema, schemaInfo.valueField).toString();
-    } else {
-      LOGGER.info("Detected Vson input format, will convert to Avro automatically.");
-      //key / value fields are optional for Vson input
-      schemaInfo.keyField = props.getString(KEY_FIELD_PROP, "");
-      schemaInfo.valueField = props.getString(VALUE_FIELD_PROP, "");
-
-      Pair<VsonSchema, VsonSchema> vsonSchemaPair = checkVsonSchemaConsistency(fs, fileStatuses, inputFileDataSize);
-
-      VsonSchema vsonKeySchema = Utils.isNullOrEmpty(schemaInfo.keyField) ?
-          vsonSchemaPair.getFirst() : vsonSchemaPair.getFirst().recordSubtype(schemaInfo.keyField);
-      VsonSchema vsonValueSchema = Utils.isNullOrEmpty(schemaInfo.valueField) ?
-          vsonSchemaPair.getSecond() : vsonSchemaPair.getSecond().recordSubtype(schemaInfo.valueField);
-
-      schemaInfo.keySchemaString = VsonAvroSchemaAdapter.parse(vsonKeySchema.toString()).toString();
-      schemaInfo.valueSchemaString = VsonAvroSchemaAdapter.parse(vsonValueSchema.toString()).toString();
-    }
-
-    // Since the job is calculating the raw data file size, which is not accurate because of compression, key/value schema and backend storage overhead,
-    // we are applying this factor to provide a more reasonable estimation.
-    return new Pair<>(schemaInfo, inputFileDataSize.get() * INPUT_DATA_SIZE_FACTOR);
   }
 
   private void initPushJobDetails() {
@@ -1040,8 +966,8 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
    * This method will talk to parent controller to validate key schema.
    */
   private void validateKeySchema(ControllerClient controllerClient, PushJobSetting setting, SchemaInfo schemaInfo) {
-    SchemaResponse keySchemaResponse = controllerClient.retryableRequest(setting.controllerRetries, c ->
-        c.getKeySchema(setting.storeName));
+    SchemaResponse keySchemaResponse =
+        controllerClient.retryableRequest(setting.controllerRetries, c -> c.getKeySchema(setting.storeName));
     if (keySchemaResponse.isError()) {
       throw new VeniceException("Got an error in keySchemaResponse: " + keySchemaResponse.toString());
     } else if (null == keySchemaResponse.getSchemaStr()) {
@@ -1072,10 +998,10 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
     SchemaResponse valueSchemaResponse;
 
     if (setting.enableWriteCompute) {
-      valueSchemaResponse = controllerClient.retryableRequest(setting.controllerRetries, c ->
+      valueSchemaResponse = ControllerClient.retryableRequest(controllerClient, setting.controllerRetries, c ->
           c.getValueOrDerivedSchemaId(setting.storeName, schemaInfo.valueSchemaString));
     } else {
-      valueSchemaResponse = controllerClient.retryableRequest(setting.controllerRetries, c ->
+      valueSchemaResponse = ControllerClient.retryableRequest(controllerClient, setting.controllerRetries, c ->
           c.getValueSchemaID(setting.storeName, schemaInfo.valueSchemaString));
     }
     if (valueSchemaResponse.isError() && !schemaAutoRegisteFromPushJobEnabled) {
@@ -1088,7 +1014,7 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
     if (schemaAutoRegisteFromPushJobEnabled) {
       if (valueSchemaResponse.isError()) {
         LOGGER.info("Auto registering value schema: " + schemaInfo.valueSchemaString + " for store: " + setting.storeName);
-        valueSchemaResponse = controllerClient.retryableRequest(setting.controllerRetries, c ->
+        ControllerClient.retryableRequest(controllerClient, setting.controllerRetries, c ->
             c.addValueSchema(setting.storeName, schemaInfo.valueSchemaString));
         if (valueSchemaResponse.isError()) {
           throw new VeniceException("Failed to auto-register value schema for store: " + setting.storeName
@@ -1109,7 +1035,9 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
 
   private StoreSetting getSettingsFromController(ControllerClient controllerClient, PushJobSetting setting) {
     StoreSetting storeSetting = new StoreSetting();
-    StoreResponse storeResponse = controllerClient.retryableRequest(setting.controllerRetries, c -> c.getStore(setting.storeName));
+    StoreResponse storeResponse =
+        ControllerClient.retryableRequest(controllerClient, setting.controllerRetries, c -> c.getStore(setting.storeName));
+
     if (storeResponse.isError()) {
       throw new VeniceException("Can't get store info. " + storeResponse.getError());
     }
@@ -1118,9 +1046,11 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
     if (storeSetting.storeStorageQuota != Store.UNLIMITED_STORAGE_QUOTA && setting.isMapOnly) {
       throw new VeniceException("Can't run this mapper only job since storage quota is not unlimited. " + "Store: " + setting.storeName);
     }
-
-    StorageEngineOverheadRatioResponse storageEngineOverheadRatioResponse =
-        controllerClient.retryableRequest(setting.controllerRetries, c -> c.getStorageEngineOverheadRatio(setting.storeName));
+    StorageEngineOverheadRatioResponse storageEngineOverheadRatioResponse = ControllerClient.retryableRequest(
+        controllerClient,
+        setting.controllerRetries,
+        c -> c.getStorageEngineOverheadRatio(setting.storeName)
+    );
     if (storageEngineOverheadRatioResponse.isError()) {
       throw new VeniceException("Can't get storage engine overhead ratio. " +
           storageEngineOverheadRatioResponse.getError());
@@ -1195,11 +1125,13 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
     //If WriteCompute is enabled, request for intermediate topic
     final boolean finalWriteComputeEnabled = writeComputeEnabled;
     versionTopicInfo = new VersionTopicInfo();
-    VersionCreationResponse versionCreationResponse = controllerClient.retryableRequest(setting.controllerRetries,
-          c -> c.requestTopicForWrites(setting.storeName, inputFileDataSize, pushType, pushId,
-              askControllerToSendControlMessage, sorted, finalWriteComputeEnabled, partitioners, dictionary,
-              Optional.ofNullable(setting.batchStartingFabric)));
-
+    VersionCreationResponse versionCreationResponse = ControllerClient.retryableRequest(
+        controllerClient,
+        setting.controllerRetries,
+        c -> c.requestTopicForWrites(setting.storeName, inputFileDataSize, pushType, pushId,
+            askControllerToSendControlMessage, sorted, finalWriteComputeEnabled, partitioners, dictionary,
+            Optional.ofNullable(setting.batchStartingFabric))
+    );
     if (versionCreationResponse.isError()) {
       throw new VeniceException("Failed to create new store version with urls: " + setting.veniceControllerUrl
           + ", error: " + versionCreationResponse.getError());
@@ -1338,9 +1270,11 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
       }
       pollTime = currentTime + pushJobSetting.pollJobStatusIntervalMs;
 
-      JobStatusQueryResponse response = controllerClient.retryableRequest(
+      JobStatusQueryResponse response = ControllerClient.retryableRequest(
+          controllerClient,
           pushJobSetting.controllerStatusPollRetries,
-          client -> client.queryOverallJobStatus(topicToMonitor, incrementalPushVersion));
+          client -> client.queryOverallJobStatus(topicToMonitor, incrementalPushVersion)
+      );
       if (response.isError()) {
         // status could not be queried which could be due to a communication error.
         throw new VeniceException("Failed to connect to: " + pushJobSetting.veniceControllerUrl +
@@ -1679,7 +1613,11 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
       if (Utils.isNullOrEmpty(versionTopicInfo.topic)) {
         LOGGER.error("Could not find a store version to delete for store: " + pushJobSetting.storeName);
       } else {
-        controllerClient.retryableRequest(pushJobSetting.controllerRetries, c -> c.killOfflinePushJob(versionTopicInfo.topic));
+        ControllerClient.retryableRequest(
+            controllerClient,
+            pushJobSetting.controllerRetries,
+            c -> c.killOfflinePushJob(versionTopicInfo.topic)
+        );
         LOGGER.info("Offline push job has been killed, topic: " + versionTopicInfo.topic);
       }
     }
@@ -1703,121 +1641,6 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
       LOGGER.info(String.format("Received exception while killing map-reduce job with name %s and ID %d",
           runningJob.getJobName(), runningJob.getID().getId()), ex);
     }
-  }
-
-  protected Schema extractAvroSubSchema(Schema origin, String fieldName) {
-    Schema.Field field = origin.getField(fieldName);
-
-    if (field == null) {
-      throw new VeniceSchemaFieldNotFoundException(fieldName, "Could not find field: " + fieldName + " from " + origin.toString());
-    }
-
-    return field.schema();
-  }
-
-  private Pair<Schema, Schema> getAvroFileHeader(FileSystem fs, Path path, boolean buildDictionary) {
-    LOGGER.debug("path:" + path.toUri().getPath());
-
-    String keyField = props.getString(KEY_FIELD_PROP);
-    String valueField = props.getString(VALUE_FIELD_PROP);
-    VeniceAvroRecordReader recordReader = new VeniceAvroRecordReader(null, keyField, valueField, fs, path, pushJobSetting.etlValueSchemaTransformation);
-
-    // If dictionary compression is enabled for version, read the records to get training samples
-    if (buildDictionary && storeSetting.compressionStrategy == CompressionStrategy.ZSTD_WITH_DICT) {
-      loadZstdTrainingSamples(recordReader);
-    }
-
-    return new Pair<>(recordReader.getFileSchema(), recordReader.getStoreSchema());
-  }
-
-  private Pair<VsonSchema, VsonSchema> getVsonFileHeader(FileSystem fs, Path path, boolean buildDictionary) {
-    Map<String, String> fileMetadata = getMetadataFromSequenceFile(fs, path, buildDictionary);
-    if (!fileMetadata.containsKey(FILE_KEY_SCHEMA) || !fileMetadata.containsKey(FILE_VALUE_SCHEMA)) {
-      throw new VeniceException("Can't find Vson schema from file: " + path.getName());
-    }
-
-    return new Pair<>(VsonSchema.parse(fileMetadata.get(FILE_KEY_SCHEMA)),
-        VsonSchema.parse(fileMetadata.get(FILE_VALUE_SCHEMA)));
-  }
-
-  /**
-   * This function is to execute HDFS operation in parallel, and the level of parallelism is controlled by this config: {@link #HDFS_OPERATIONS_PARALLEL_THREAD_NUM}
-   */
-  private void parallelExecuteHDFSOperation(final FileStatus[] fileStatusList, String operation, Consumer<FileStatus> fileStatusConsumer) {
-    if (hdfsExecutorService == null) {
-      throw new VeniceException("Unable to execute HDFS operations in parallel, the executor is uninitialized");
-    }
-    int len = fileStatusList.length;
-    CompletableFuture<Void>[] futures = new CompletableFuture[len];
-    for (int cur = 0; cur < len; ++cur) {
-      final int finalCur = cur;
-      futures[cur] = CompletableFuture.runAsync(() -> fileStatusConsumer.accept(fileStatusList[finalCur]),
-          hdfsExecutorService);
-    }
-    try {
-      CompletableFuture.allOf(futures).get();
-    } catch (Exception e) {
-      if (e.getCause() instanceof VeniceException) {
-        throw (VeniceException) e.getCause();
-      }
-      throw new VeniceException("Failed to execute " + operation + " in parallel", e);
-    }
-  }
-
-  //Avro-based file composes key and value schema as a whole
-  private Pair<Schema, Schema> checkAvroSchemaConsistency(FileSystem fs, FileStatus[] fileStatusList, AtomicLong inputFileDataSize) {
-    Pair<Schema, Schema> avroSchema = getAvroFileHeader(fs, fileStatusList[0].getPath(), false);
-    parallelExecuteHDFSOperation(fileStatusList, "checkAvroSchemaConsistency", fileStatus -> {
-      if (fileStatus.isDirectory()) {
-        // Map-reduce job will fail if the input directory has sub-directory and 'recursive' is not specified.
-        throw new VeniceException("Input directory: " + fileStatus.getPath().getParent().getName() +
-            " should not have sub directory: " + fileStatus.getPath().getName());
-      }
-      inputFileDataSize.addAndGet(fileStatus.getLen());
-      Pair<Schema, Schema> newSchema = getAvroFileHeader(fs, fileStatus.getPath(), true);
-      if (!avroSchema.equals(newSchema)) {
-        throw new VeniceInconsistentSchemaException(String.format("Inconsistent file Avro schema found. File: %s.\n"
-                + "Expected file schema: %s.\n Real File schema: %s.", fileStatus.getPath().getName(),
-            avroSchema.toString(), newSchema.toString()));
-      }
-    });
-    return avroSchema;
-  }
-
-  //Vson-based file store key / value schema string as separated properties in file header
-  private Pair<VsonSchema, VsonSchema> checkVsonSchemaConsistency(FileSystem fs, FileStatus[] fileStatusList,
-      AtomicLong inputFileDataSize) {
-    Pair<VsonSchema, VsonSchema> vsonSchema = getVsonFileHeader(fs, fileStatusList[0].getPath(), false);
-    parallelExecuteHDFSOperation(fileStatusList, "checkVsonSchemaConsistency", fileStatus -> {
-      if (fileStatus.isDirectory()) {
-        throw new VeniceException("Input directory: " + fileStatus.getPath().getParent().getName() +
-            " should not have sub directory: " + fileStatus.getPath().getName());
-      }
-      inputFileDataSize.addAndGet(fileStatus.getLen());
-      Pair<VsonSchema, VsonSchema> newSchema = getVsonFileHeader(fs, fileStatus.getPath(), true);
-      if (!vsonSchema.getFirst().equals(newSchema.getFirst()) || !vsonSchema.getSecond().equals(newSchema.getSecond())) {
-        throw new VeniceInconsistentSchemaException(String.format("Inconsistent file Vson schema found. File: %s.\n Expected key schema: %s.\n"
-                + "Expected value schema: %s.\n File key schema: %s.\n File value schema: %s.", fileStatus.getPath().getName(),
-            vsonSchema.getFirst().toString(), vsonSchema.getSecond().toString(), newSchema.getFirst().toString(), newSchema.getSecond().toString()));
-      }
-    });
-
-    return vsonSchema;
-  }
-
-  private Map<String, String> getMetadataFromSequenceFile(FileSystem fs, Path path, boolean buildDictionary) {
-    LOGGER.debug("path:" + path.toUri().getPath());
-
-    String keyField = props.getString(KEY_FIELD_PROP, "");
-    String valueField = props.getString(VALUE_FIELD_PROP, "");
-    VeniceVsonRecordReader recordReader = new VeniceVsonRecordReader(null, keyField, valueField, fs, path);
-
-    // If dictionary compression is enabled for version, read the records to get training samples
-    if (buildDictionary && storeSetting.compressionStrategy == CompressionStrategy.ZSTD_WITH_DICT) {
-      loadZstdTrainingSamples(recordReader);
-    }
-
-    return recordReader.getMetadataMap();
   }
 
   /**
@@ -1892,17 +1715,6 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
       LOGGER.info("Found cluster: " + clusterName + " for store: " + setting.storeName);
       return clusterName;
     }
-  }
-
-  protected void initZstdConfig(int numFiles) {
-    if (zstdConfig != null) {
-      return;
-    }
-    zstdConfig = new ZstdConfig();
-    zstdConfig.dictSize = props.getInt(COMPRESSION_DICTIONARY_SIZE_LIMIT, VeniceWriter.DEFAULT_MAX_SIZE_FOR_USER_PAYLOAD_PER_MESSAGE_IN_BYTES);
-    zstdConfig.sampleSize = props.getInt(COMPRESSION_DICTIONARY_SAMPLE_SIZE, 200 * 1024 * 1024); // 200 MB samples
-    zstdConfig.maxBytesPerFile = zstdConfig.sampleSize / numFiles;
-    zstdConfig.zstdDictTrainer = new ZstdDictTrainer(zstdConfig.sampleSize, zstdConfig.dictSize);
   }
 
   public String getKafkaTopic() {
