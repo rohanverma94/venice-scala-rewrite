@@ -1,6 +1,7 @@
 package com.linkedin.venice.hadoop;
 
 import com.github.luben.zstd.Zstd;
+import com.google.common.annotations.VisibleForTesting;
 import com.linkedin.venice.compression.CompressionStrategy;
 import com.linkedin.venice.compression.CompressorFactory;
 import com.linkedin.venice.compression.VeniceCompressor;
@@ -43,6 +44,16 @@ public abstract class AbstractVeniceMapper<INPUT_KEY, INPUT_VALUE>
   private VeniceCompressor compressor;
 
   protected AbstractVeniceRecordReader<INPUT_KEY, INPUT_VALUE> veniceRecordReader;
+
+  @VisibleForTesting
+  protected void setVeniceReducer(VeniceReducer reducer) {
+    this.reducer = reducer;
+  }
+
+  @VisibleForTesting
+  protected void setIsMapperOnly(boolean isMapperOnly) {
+    this.isMapperOnly = isMapperOnly;
+  }
 
   @Override
   public void map(INPUT_KEY inputKey, INPUT_VALUE inputValue, OutputCollector<BytesWritable, BytesWritable> output, Reporter reporter)

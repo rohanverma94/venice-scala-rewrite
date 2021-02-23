@@ -1,5 +1,6 @@
 package com.linkedin.venice.hadoop;
 
+import com.linkedin.venice.exceptions.TopicAuthorizationVeniceException;
 import com.linkedin.venice.exceptions.UndefinedPropertyException;
 import com.linkedin.venice.exceptions.VeniceException;
 import org.apache.avro.Schema;
@@ -15,9 +16,9 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 import org.testng.Assert;
 import org.testng.annotations.Test;
-
 import java.io.IOException;
 
+import static com.linkedin.venice.hadoop.MapReduceConstants.*;
 import static org.mockito.Mockito.*;
 
 public class TestVeniceAvroMapper extends AbstractTestVeniceMR {
@@ -45,11 +46,7 @@ public class TestVeniceAvroMapper extends AbstractTestVeniceMR {
   public void testMap() throws IOException {
     final String keyFieldValue = "key_field_value";
     final String valueFieldValue = "value_field_value";
-    GenericData.Record record = new GenericData.Record(Schema.parse(SCHEMA_STR));
-    record.put(KEY_FIELD, keyFieldValue);
-    record.put(VALUE_FIELD, valueFieldValue);
-
-    AvroWrapper<IndexedRecord> wrapper = new AvroWrapper(record);
+    AvroWrapper<IndexedRecord> wrapper = getAvroWrapper(keyFieldValue, valueFieldValue);
     OutputCollector<BytesWritable, BytesWritable> output = mock(OutputCollector.class);
 
     VeniceAvroMapper mapper = new VeniceAvroMapper();
@@ -68,11 +65,7 @@ public class TestVeniceAvroMapper extends AbstractTestVeniceMR {
   @Test (expectedExceptions = VeniceException.class)
   public void testMapWithNullKey() throws IOException {
     final String valueFieldValue = "value_field_value";
-    GenericData.Record record = new GenericData.Record(Schema.parse(SCHEMA_STR));
-    record.put(KEY_FIELD, null);
-    record.put(VALUE_FIELD, valueFieldValue);
-
-    AvroWrapper<IndexedRecord> wrapper = new AvroWrapper(record);
+    AvroWrapper<IndexedRecord> wrapper = getAvroWrapper(null, valueFieldValue);
     OutputCollector<BytesWritable, BytesWritable> output = mock(OutputCollector.class);
 
     VeniceAvroMapper mapper = new VeniceAvroMapper();
@@ -83,11 +76,7 @@ public class TestVeniceAvroMapper extends AbstractTestVeniceMR {
   @Test
   public void testMapWithNullValue() throws IOException {
     final String keyFieldValue = "key_field_value";
-    GenericData.Record record = new GenericData.Record(Schema.parse(SCHEMA_STR));
-    record.put(KEY_FIELD, keyFieldValue);
-    record.put(VALUE_FIELD, null);
-
-    AvroWrapper<IndexedRecord> wrapper = new AvroWrapper(record);
+    AvroWrapper<IndexedRecord> wrapper = getAvroWrapper(keyFieldValue, null);
     OutputCollector<BytesWritable, BytesWritable> output = mock(OutputCollector.class);
 
     VeniceAvroMapper mapper = new VeniceAvroMapper();
@@ -95,5 +84,30 @@ public class TestVeniceAvroMapper extends AbstractTestVeniceMR {
     mapper.map(wrapper, NullWritable.get(), output, mock(Reporter.class));
 
     verify(output, never()).collect(Mockito.any(), Mockito.any());
+  }
+
+  @Test
+  public void testMapWithTopicAuthorizationException() throws IOException {
+    final String keyFieldValue = "key_field_value";
+    final String valueFieldValue = "value_field_value";
+    AvroWrapper<IndexedRecord> wrapper = getAvroWrapper(keyFieldValue, valueFieldValue);
+    OutputCollector<BytesWritable, BytesWritable> output = mock(OutputCollector.class);
+    Reporter mockReporter = mock(Reporter.class);
+    VeniceReducer mockReducer = mock(VeniceReducer.class);
+    doThrow(new TopicAuthorizationVeniceException("No ACL permission")).when(mockReducer).sendMessageToKafka(any(), any(), any());
+
+    VeniceAvroMapper mapper = new VeniceAvroMapper();
+    mapper.configure(setupJobConf());
+    mapper.setVeniceReducer(mockReducer);
+    mapper.setIsMapperOnly(true);
+    mapper.map(wrapper, NullWritable.get(), output, mockReporter);
+    verify(mockReporter, times(1)).incrCounter(eq(COUNTER_GROUP_KAFKA), eq(AUTHORIZATION_FAILURES), eq(1L));
+  }
+
+  private AvroWrapper<IndexedRecord> getAvroWrapper(String keyFieldValue, String valueFieldValue) {
+    GenericData.Record record = new GenericData.Record(Schema.parse(SCHEMA_STR));
+    record.put(KEY_FIELD, keyFieldValue);
+    record.put(VALUE_FIELD, valueFieldValue);
+    return new AvroWrapper<>(record);
   }
 }

@@ -1,5 +1,6 @@
 package com.linkedin.venice.hadoop;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.linkedin.avroutil1.compatibility.AvroCompatibilityHelper;
 import com.linkedin.venice.ConfigKeys;
 import com.linkedin.venice.exceptions.QuotaExceededException;
@@ -346,7 +347,7 @@ public class VeniceReducer implements Reducer<BytesWritable, BytesWritable, Null
         messageSent, messageCompleted.get(), messageErrored.get()));
   }
 
-  // For test purpose
+  @VisibleForTesting
   protected void setVeniceWriter(AbstractVeniceWriter veniceWriter) {
     this.veniceWriter = veniceWriter;
   }
