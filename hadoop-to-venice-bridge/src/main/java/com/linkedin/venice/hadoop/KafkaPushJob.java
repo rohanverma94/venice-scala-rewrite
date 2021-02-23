@@ -1,5 +1,6 @@
 package com.linkedin.venice.hadoop;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.linkedin.venice.compression.CompressionStrategy;
 import com.linkedin.venice.controllerapi.ControllerClient;
 import com.linkedin.venice.controllerapi.ControllerResponse;
@@ -65,6 +66,7 @@ import org.apache.hadoop.mapred.JobClient;
 import org.apache.hadoop.mapred.JobConf;
 import org.apache.hadoop.mapred.RunningJob;
 import org.apache.hadoop.mapred.lib.NullOutputFormat;
+import org.apache.hadoop.yarn.webapp.Controller;
 import org.apache.kafka.clients.CommonClientConfigs;
 import org.apache.log4j.Logger;
 import java.io.IOException;
@@ -281,6 +283,9 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
 
   // Thread pool for Hadoop File System operations.
   private ExecutorService hdfsExecutorService;
+  private JobClientWrapper jobClientWrapper;
+  // A controller client that is used to discover cluster
+  private ControllerClient clusterDiscoveryControllerClient;
 
   protected static class SchemaInfo {
     boolean isAvro = true;
@@ -405,7 +410,13 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
   public KafkaPushJob(String jobId, Properties vanillaProps) {
     super(jobId, LOGGER);
     this.id = jobId;
+    this.props = getVenicePropsFromVanillaProps(vanillaProps);
+    LOGGER.info("Constructing " + KafkaPushJob.class.getSimpleName() + ": " + props.toString(true));
+    // Optional configs:
+    pushJobSetting = getPushJobSetting(props);
+  }
 
+  private VeniceProperties getVenicePropsFromVanillaProps(Properties vanillaProps) {
     if (vanillaProps.containsKey(LEGACY_AVRO_KEY_FIELD_PROP)) {
       if (vanillaProps.containsKey(KEY_FIELD_PROP) &&
           !vanillaProps.getProperty(KEY_FIELD_PROP).equals(vanillaProps.getProperty(LEGACY_AVRO_KEY_FIELD_PROP))) {
@@ -420,19 +431,17 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
       }
       vanillaProps.setProperty(VALUE_FIELD_PROP, vanillaProps.getProperty(LEGACY_AVRO_VALUE_FIELD_PROP));
     }
-
     String[] requiredSSLPropertiesNames = new String[]{SSL_KEY_PASSWORD_PROPERTY_NAME,SSL_KEY_STORE_PASSWORD_PROPERTY_NAME, SSL_KEY_STORE_PROPERTY_NAME,SSL_TRUST_STORE_PROPERTY_NAME};
-    for(String sslPropertyName:requiredSSLPropertiesNames){
-      if(!vanillaProps.containsKey(sslPropertyName)){
+    for (String sslPropertyName : requiredSSLPropertiesNames) {
+      if (!vanillaProps.containsKey(sslPropertyName)) {
         throw new VeniceException("Miss the require ssl property name: "+sslPropertyName);
       }
     }
+    return new VeniceProperties(vanillaProps);
+  }
 
-    this.props = new VeniceProperties(vanillaProps);
-    LOGGER.info("Constructing " + KafkaPushJob.class.getSimpleName() + ": " + props.toString(true));
-
-    // Optional configs:
-    pushJobSetting = new PushJobSetting();
+  private PushJobSetting getPushJobSetting(VeniceProperties props) {
+    PushJobSetting pushJobSetting = new PushJobSetting();
     pushJobSetting.enablePush = props.getBoolean(ENABLE_PUSH, true);
     /**
      * TODO: after controller SSL support is rolled out everywhere, change the default behavior for ssl enabled to true;
@@ -488,6 +497,22 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
     if (!pushJobSetting.enablePush && !pushJobSetting.enablePBNJ) {
       throw new VeniceException("At least one of the following config properties must be true: " + ENABLE_PUSH + " or " + PBNJ_ENABLE);
     }
+    return pushJobSetting;
+  }
+
+  @VisibleForTesting
+  protected void setControllerClient(ControllerClient controllerClient) {
+    this.controllerClient = controllerClient;
+  }
+
+  @VisibleForTesting
+  protected void setJobClientWrapper(JobClientWrapper jobClientWrapper) {
+    this.jobClientWrapper = jobClientWrapper;
+  }
+
+  @VisibleForTesting
+  protected void setClusterDiscoveryControllerClient(ControllerClient clusterDiscoveryControllerClient) {
+    this.clusterDiscoveryControllerClient = clusterDiscoveryControllerClient;
   }
 
   /**
@@ -507,17 +532,12 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
       initPushJobDetails();
       jobStartTimeMs = System.currentTimeMillis();
       logGreeting();
-      hdfsExecutorService = Executors.newFixedThreadPool(props.getInt(HDFS_OPERATIONS_PARALLEL_THREAD_NUM, 20));
-      Optional<SSLFactory> sslFactory = Optional.empty();
-      if (pushJobSetting.enableSsl) {
-        LOGGER.info("Controller ACL is enabled.");
-        Properties sslProps = getSslProperties();
-        sslFactory = Optional.of(SslUtils.getSSLFactory(sslProps, pushJobSetting.sslFactoryClassName));
-      }
-      // Discover the cluster based on the store name and re-initialized controller client.
-      this.clusterName = discoverCluster(pushJobSetting, sslFactory);
+      Optional<SSLFactory> sslFactory = createSSlFactory();
+      initControllerClient(sslFactory);
+      // Discover the cluster based on the store name
+      clusterName = discoverCluster(pushJobSetting, sslFactory);
       pushJobDetails.clusterName = clusterName;
-      this.controllerClient = new ControllerClient(clusterName, pushJobSetting.veniceControllerUrl, sslFactory);
+      hdfsExecutorService = Executors.newFixedThreadPool(props.getInt(HDFS_OPERATIONS_PARALLEL_THREAD_NUM, 20));
       sendPushJobDetailsToController();
       this.inputDirectory = getInputURI(this.props);
       this.storeSetting = getSettingsFromController(controllerClient, pushJobSetting);
@@ -536,9 +556,8 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
       // TODO: do we actually need this information?
       Pair<SchemaInfo, Long> inputInfoPair = validateInputAndGetSchema(this.inputDirectory, this.props);
       // Get input schema
-      this.schemaInfo = inputInfoPair.getFirst();
-      this.inputFileDataSize = inputInfoPair.getSecond();
-
+      schemaInfo = inputInfoPair.getFirst();
+      inputFileDataSize = inputInfoPair.getSecond();
       validateKeySchema(controllerClient, pushJobSetting, schemaInfo);
       validateValueSchema(controllerClient, pushJobSetting, schemaInfo, storeSetting.isSchemaAutoRegisteFromPushJobEnabled);
 
@@ -576,7 +595,7 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
           pushJobSetting.incrementalPushVersion = Optional.of(String.valueOf(System.currentTimeMillis()));
           getVeniceWriter(versionTopicInfo).broadcastStartOfIncrementalPush(pushJobSetting.incrementalPushVersion.get(), new HashMap<>());
           updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.START_MAP_REDUCE_JOB);
-          runningJob = JobClient.runJob(jobConf);
+          runningJob = runJobWithConfig(jobConf);
           jobSucceeded = updatePushJobDetailsWithMRDetails();
           if (jobSucceeded) {
             updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.MAP_REDUCE_JOB_COMPLETED);
@@ -599,7 +618,7 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
              */
           }
           updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.START_MAP_REDUCE_JOB);
-          runningJob = JobClient.runJob(jobConf);
+          runningJob = runJobWithConfig(jobConf);
           jobSucceeded = updatePushJobDetailsWithMRDetails();
           if (jobSucceeded) {
             updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.MAP_REDUCE_JOB_COMPLETED);
@@ -633,7 +652,7 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
       if (pushJobSetting.enablePBNJ) {
         LOGGER.info("Post-Bulkload Analysis Job is about to run.");
         setupPBNJConf(pbnjJobConf, versionTopicInfo, pushJobSetting, schemaInfo, storeSetting, props, id, inputDirectory);
-        runningJob = JobClient.runJob(pbnjJobConf);
+        runningJob = runJobWithConfig(pbnjJobConf);
       }
     } catch (Throwable e) {
       LOGGER.error("Failed to run job.", e);
@@ -658,6 +677,39 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
       throwVeniceException(e);
     } finally {
       shutdownHdfsExecutorService();
+    }
+  }
+
+  private Optional<SSLFactory> createSSlFactory() {
+    Optional<SSLFactory> sslFactory = Optional.empty();
+    if (pushJobSetting.enableSsl) {
+      LOGGER.info("Controller ACL is enabled.");
+      Properties sslProps = getSslProperties();
+      sslFactory = Optional.of(SslUtils.getSSLFactory(sslProps, pushJobSetting.sslFactoryClassName));
+    }
+    return sslFactory;
+  }
+
+  private RunningJob runJobWithConfig(JobConf jobConf) throws IOException {
+    if (jobClientWrapper == null) {
+      jobClientWrapper = new JobClientWrapperImpl();
+    }
+    return jobClientWrapper.runJobWithConfig(jobConf);
+  }
+
+  /**
+   * Create a new instance of controller client and set it to the controller client field if the controller client field
+   * has null value. If the controller client field is not null, it could mean:
+   *    1. The controller client field has already been initialized
+   *    2. A mock controller client is provided
+   *
+   * @param sslFactory
+   */
+  private void initControllerClient(Optional<SSLFactory> sslFactory) {
+    if (controllerClient == null) {
+       controllerClient = new ControllerClient(clusterName, pushJobSetting.veniceControllerUrl, sslFactory);
+    } else {
+      LOGGER.warn("Controller client has already been initialized");
     }
   }
 
@@ -1170,7 +1222,7 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
   }
 
   private synchronized VeniceWriter<KafkaKey, byte[], byte[]> getVeniceWriter(VersionTopicInfo versionTopicInfo) {
-    if (null == this.veniceWriter) {
+    if (veniceWriter == null) {
       // Initialize VeniceWriter
       VeniceWriterFactory veniceWriterFactory = new VeniceWriterFactory(getVeniceWriterProperties(versionTopicInfo));
       Properties partitionerProperties = new Properties();
@@ -1183,9 +1235,9 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
       VeniceWriter<KafkaKey, byte[], byte[]> newVeniceWriter =
           veniceWriterFactory.createVeniceWriter(versionTopicInfo.topic, venicePartitioner);
       LOGGER.info("Created VeniceWriter: " + newVeniceWriter.toString());
-      this.veniceWriter = newVeniceWriter;
+      veniceWriter = newVeniceWriter;
     }
-    return this.veniceWriter;
+    return veniceWriter;
   }
 
   private synchronized Properties getVeniceWriterProperties(VersionTopicInfo versionTopicInfo) {
@@ -1237,9 +1289,9 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
   }
 
   private synchronized void closeVeniceWriter() {
-    if (null != this.veniceWriter) {
-      this.veniceWriter.close();
-      this.veniceWriter = null;
+    if (veniceWriter != null) {
+      veniceWriter.close();
+      veniceWriter = null;
     }
   }
 
@@ -1827,7 +1879,12 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
   private String discoverCluster(PushJobSetting setting, Optional<SSLFactory> sslFactory) {
     LOGGER.info("Discover cluster for store:" + setting.storeName);
     // TODO: Evaluate what's the proper way to add retries here...
-    ControllerResponse clusterDiscoveryResponse = ControllerClient.discoverCluster(setting.veniceControllerUrl, setting.storeName, sslFactory);
+    ControllerResponse clusterDiscoveryResponse;
+    if (clusterDiscoveryControllerClient == null) {
+      clusterDiscoveryResponse = ControllerClient.discoverCluster(setting.veniceControllerUrl, setting.storeName, sslFactory);
+    } else {
+      clusterDiscoveryResponse = clusterDiscoveryControllerClient.discoverCluster(setting.storeName);
+    }
     if (clusterDiscoveryResponse.isError()) {
       throw new VeniceException("Get error in clusterDiscoveryResponse:" + clusterDiscoveryResponse.getError());
     } else {
