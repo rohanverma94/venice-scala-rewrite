@@ -589,7 +589,6 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
         // If reducer phase is enabled, each reducer will sort all the messages inside one single
         // topic partition.
         setupMRConf(jobConf, versionTopicInfo, pushJobSetting, schemaInfo, storeSetting, props, id, inputDirectory);
-        boolean jobSucceeded;
         if (pushJobSetting.isIncrementalPush) {
           /**
            * N.B.: For now, we always send control messages directly for incremental pushes, regardless of
@@ -601,8 +600,8 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
           getVeniceWriter(versionTopicInfo).broadcastStartOfIncrementalPush(pushJobSetting.incrementalPushVersion.get(), new HashMap<>());
           updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.START_MAP_REDUCE_JOB);
           runningJob = runJobWithConfig(jobConf);
-          jobSucceeded = updatePushJobDetailsWithMRDetails();
-          if (jobSucceeded) {
+          updatePushJobDetailsWithMRDetails();
+          if (!pushJobDetailsWithFailureCheckpoint()) {
             updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.MAP_REDUCE_JOB_COMPLETED);
             getVeniceWriter(versionTopicInfo)
                 .broadcastEndOfIncrementalPush(pushJobSetting.incrementalPushVersion.get(), Collections.emptyMap());
@@ -624,8 +623,8 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
           }
           updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.START_MAP_REDUCE_JOB);
           runningJob = runJobWithConfig(jobConf);
-          jobSucceeded = updatePushJobDetailsWithMRDetails();
-          if (jobSucceeded) {
+          updatePushJobDetailsWithMRDetails();
+          if (!pushJobDetailsWithFailureCheckpoint()) {
             updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.MAP_REDUCE_JOB_COMPLETED);
             if (pushJobSetting.sendControlMessagesDirectly) {
               getVeniceWriter(versionTopicInfo).broadcastEndOfPush(Collections.emptyMap());
@@ -639,7 +638,7 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
         closeVeniceWriter();
         // Update and send push job details with new info
         updatePushJobDetailsWithMRCounters();
-        if (jobSucceeded) {
+        if (!pushJobDetailsWithFailureCheckpoint()) {
           pushJobDetails.overallStatus.add(getPushJobDetailsStatusTuple(PushJobDetailsStatus.WRITE_COMPLETED.getValue()));
           sendPushJobDetailsToController();
           // Waiting for Venice Backend to complete consumption
@@ -815,6 +814,12 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
     pushJobDetails.pushJobLatestCheckpoint = checkpoint.getValue();
   }
 
+  private boolean pushJobDetailsWithFailureCheckpoint() {
+    return pushJobDetails.pushJobLatestCheckpoint == PushJobCheckpoints.QUOTA_EXCEEDED.getValue() ||
+        pushJobDetails.pushJobLatestCheckpoint == PushJobCheckpoints.WRITE_ACL_FAILED.getValue() ||
+        pushJobDetails.pushJobLatestCheckpoint == PushJobCheckpoints.DUP_KEY_WITH_DIFF_VALUE.getValue();
+  }
+
   private void updatePushJobDetailsWithMRCounters() {
     if (runningJob == null) {
       LOGGER.info("No running job to update push job details with MR counters");
@@ -856,34 +861,28 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
 
   /**
    * Best effort attempt to get more details on reasons behind MR failure by looking at MR counters
-   *
-   * @return false if MR details indicate any MR job error and vice versa
    */
-  private boolean updatePushJobDetailsWithMRDetails() {
+  private void updatePushJobDetailsWithMRDetails() {
     try {
       // Quota exceeded
       long inputFileSize = getCounter(COUNTER_GROUP_QUOTA, COUNTER_TOTAL_KEY_SIZE) + getCounter(COUNTER_GROUP_QUOTA, COUNTER_TOTAL_VALUE_SIZE);
       long veniceDiskUsageEstimate = (long) (inputFileSize / storeSetting.storageEngineOverheadRatio);
       if (veniceDiskUsageEstimate > storeSetting.storeStorageQuota) {
         updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.QUOTA_EXCEEDED);
-        return false;
       }
       // Write ACL failed
       if (getCounter(COUNTER_GROUP_KAFKA, AUTHORIZATION_FAILURES) > 0) {
         updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.WRITE_ACL_FAILED);
-        return false;
       }
       // Duplicate keys
       if (!pushJobSetting.isDuplicateKeyAllowed &&
           getCounter(COUNTER_GROUP_DATA_QUALITY, DUPLICATE_KEY_WITH_DISTINCT_VALUE) > 0) {
           updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.DUP_KEY_WITH_DIFF_VALUE);
-          return false;
       }
     } catch (Exception e) {
       LOGGER.info("Exception caught while trying to get more details on MR failure, reporting without it. "
           + NON_CRITICAL_EXCEPTION, e);
     }
-    return true;
   }
 
   private long getCounter(String groupName, String counterName) throws IOException {
