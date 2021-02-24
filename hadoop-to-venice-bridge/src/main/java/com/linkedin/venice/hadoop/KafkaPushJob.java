@@ -398,8 +398,8 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
    */
   public KafkaPushJob(String jobId, Properties vanillaProps) {
     super(jobId, LOGGER);
-    this.id = jobId;
-    this.props = getVenicePropsFromVanillaProps(vanillaProps);
+    id = jobId;
+    props = getVenicePropsFromVanillaProps(vanillaProps);
     LOGGER.info("Constructing " + KafkaPushJob.class.getSimpleName() + ": " + props.toString(true));
     // Optional configs:
     pushJobSetting = getPushJobSetting(props);
@@ -536,18 +536,18 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
       initPushJobDetails();
       jobStartTimeMs = System.currentTimeMillis();
       logGreeting();
+      hdfsExecutorService = Executors.newFixedThreadPool(props.getInt(HDFS_OPERATIONS_PARALLEL_THREAD_NUM, 20));
       Optional<SSLFactory> sslFactory = createSSlFactory();
-      initControllerClient(sslFactory);
-      // Discover the cluster based on the store name
+      // Discover the cluster based on the store name and re-initialized controller client.
       clusterName = discoverCluster(pushJobSetting, sslFactory);
       pushJobDetails.clusterName = clusterName;
-      hdfsExecutorService = Executors.newFixedThreadPool(props.getInt(HDFS_OPERATIONS_PARALLEL_THREAD_NUM, 20));
+      initControllerClient(sslFactory);
       sendPushJobDetailsToController();
-      this.inputDirectory = getInputURI(this.props);
-      this.storeSetting = getSettingsFromController(controllerClient, pushJobSetting);
+      inputDirectory = getInputURI(props);
+      storeSetting = getSettingsFromController(controllerClient, pushJobSetting);
 
       if (pushJobSetting.isSourceETL) {
-        MultiSchemaResponse allValueSchemaResponses = this.controllerClient.getAllValueSchema(pushJobSetting.storeName);
+        MultiSchemaResponse allValueSchemaResponses = controllerClient.getAllValueSchema(pushJobSetting.storeName);
         MultiSchemaResponse.Schema[] allValueSchemas = allValueSchemaResponses.getSchemas();
         Schema lastValueSchema = Schema.parse(allValueSchemas[allValueSchemas.length - 1].getSchemaStr());
 
@@ -559,7 +559,7 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
       // Check data size
       // TODO: do we actually need this information?
       InputDataInfoProvider.InputDataInfo inputInfo =
-          getInputDataInfoProvider().validateInputAndGetSchema(this.inputDirectory, this.props);
+          getInputDataInfoProvider().validateInputAndGetSchema(inputDirectory, props);
       // Get input schema
       schemaInfo = inputInfo.getSchemaInfo();
       inputFileDataSize = inputInfo.getInputFileDataSizeInBytes();
@@ -583,7 +583,7 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
         pushJobDetails.overallStatus.add(getPushJobDetailsStatusTuple(PushJobDetailsStatus.TOPIC_CREATED.getValue()));
         sendPushJobDetailsToController();
         // Log Venice data push job related info
-        logPushJobProperties(versionTopicInfo, pushJobSetting, schemaInfo, this.clusterName, this.inputDirectory, this.inputFileDataSize);
+        logPushJobProperties(versionTopicInfo, pushJobSetting, schemaInfo, clusterName, inputDirectory, inputFileDataSize);
 
         // Setup the hadoop job
         // If reducer phase is enabled, each reducer will sort all the messages inside one single
@@ -728,7 +728,7 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
     ByteBuffer compressionDictionary = null;
     if (storeSetting.compressionStrategy == CompressionStrategy.ZSTD_WITH_DICT) {
       LOGGER.info("Training Zstd dictionary");
-      compressionDictionary = ByteBuffer.wrap(this.zstdConfig.zstdDictTrainer.trainSamples());
+      compressionDictionary = ByteBuffer.wrap(zstdConfig.zstdDictTrainer.trainSamples());
       LOGGER.info("Zstd dictionary size = " + compressionDictionary.limit() + " bytes");
     } else {
       LOGGER.info("No compression dictionary is generated with the strategy " + storeSetting.compressionStrategy);
@@ -1684,13 +1684,13 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
         continue;
       }
 
-      if (fileSampleSize + data.length > this.zstdConfig.maxBytesPerFile) {
+      if (fileSampleSize + data.length > zstdConfig.maxBytesPerFile) {
         LOGGER.info("Read " + fileSampleSize + " bytes to build dictionary. Reached limit per file.");
         return;
       }
 
       // addSample returns false when the data read no longer fits in the 'sample' buffer limit
-      if (!this.zstdConfig.zstdDictTrainer.addSample(data)) {
+      if (!zstdConfig.zstdDictTrainer.addSample(data)) {
         LOGGER.info("Read " + fileSampleSize + " bytes to build dictionary. Reached maximum sample limit.");
         return;
       }
