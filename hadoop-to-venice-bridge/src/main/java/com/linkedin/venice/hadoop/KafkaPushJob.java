@@ -274,6 +274,7 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
   // A controller client that is used to discover cluster
   private ControllerClient clusterDiscoveryControllerClient;
   private InputDataInfoProvider inputDataInfoProvider;
+  private SentPushJobDetailsTracker sentPushJobDetailsTracker;
 
   protected static class SchemaInfo {
     boolean isAvro = true;
@@ -506,6 +507,16 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
   @VisibleForTesting
   protected void setInputDataInfoProvider(InputDataInfoProvider inputDataInfoProvider) {
     this.inputDataInfoProvider = inputDataInfoProvider;
+  }
+
+  @VisibleForTesting
+  protected void setVeniceWriter(VeniceWriter<KafkaKey, byte[], byte[]> veniceWriter) {
+    this.veniceWriter = veniceWriter;
+  }
+
+  @VisibleForTesting
+  protected void setSentPushJobDetailsTracker(SentPushJobDetailsTracker sentPushJobDetailsTracker) {
+    this.sentPushJobDetailsTracker = sentPushJobDetailsTracker;
   }
 
   /**
@@ -866,6 +877,7 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
       if (!pushJobSetting.isDuplicateKeyAllowed &&
           getCounter(COUNTER_GROUP_DATA_QUALITY, DUPLICATE_KEY_WITH_DISTINCT_VALUE) > 0) {
           updatePushJobDetailsWithCheckpoint(PushJobCheckpoints.DUP_KEY_WITH_DIFF_VALUE);
+          return false;
       }
     } catch (Exception e) {
       LOGGER.info("Exception caught while trying to get more details on MR failure, reporting without it. "
@@ -923,15 +935,26 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
     try {
       pushJobDetails.reportTimestamp = System.currentTimeMillis();
       int version = versionTopicInfo == null ? -1 : versionTopicInfo.version;
-      ControllerResponse response =
-          controllerClient.sendPushJobDetails(pushJobSetting.storeName, version,
-              pushJobDetailsSerializer.serialize(null, pushJobDetails));
+      ControllerResponse response = controllerClient.sendPushJobDetails(
+          pushJobSetting.storeName,
+          version,
+          pushJobDetailsSerializer.serialize(null, pushJobDetails)
+      );
+      getSentPushJobDetailsTracker().record(pushJobSetting.storeName, version, pushJobDetails);
+
       if (response.isError()) {
         LOGGER.warn("Failed to send push job details. " + NON_CRITICAL_EXCEPTION + " Details: " + response.getError());
       }
     } catch (Exception e) {
       LOGGER.error("Exception caught while sending push job details. " + NON_CRITICAL_EXCEPTION, e);
     }
+  }
+
+  private SentPushJobDetailsTracker getSentPushJobDetailsTracker() {
+    if (sentPushJobDetailsTracker == null) {
+      sentPushJobDetailsTracker = new NoOpSentPushJobDetailsTracker();
+    }
+    return sentPushJobDetailsTracker;
   }
 
   private void logGreeting() {
@@ -967,7 +990,7 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
    */
   private void validateKeySchema(ControllerClient controllerClient, PushJobSetting setting, SchemaInfo schemaInfo) {
     SchemaResponse keySchemaResponse =
-        controllerClient.retryableRequest(setting.controllerRetries, c -> c.getKeySchema(setting.storeName));
+        ControllerClient.retryableRequest(controllerClient, setting.controllerRetries, c -> c.getKeySchema(setting.storeName));
     if (keySchemaResponse.isError()) {
       throw new VeniceException("Got an error in keySchemaResponse: " + keySchemaResponse.toString());
     } else if (null == keySchemaResponse.getSchemaStr()) {
@@ -1607,7 +1630,7 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
         if (!Utils.isNullOrEmpty(versionTopicInfo.topic)) {
           break;
         }
-        Utils.sleep(Duration.ofSeconds(10).toMillis());
+        Utils.sleep(Duration.ofMillis(10).toMillis());
         currentRetryAttempt++;
       }
       if (Utils.isNullOrEmpty(versionTopicInfo.topic)) {

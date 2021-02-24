@@ -1,29 +1,120 @@
 package com.linkedin.venice.hadoop;
 
+import com.linkedin.venice.compression.CompressionStrategy;
 import com.linkedin.venice.controllerapi.ControllerClient;
 import com.linkedin.venice.controllerapi.ControllerResponse;
 import com.linkedin.venice.controllerapi.D2ServiceDiscoveryResponse;
+import com.linkedin.venice.controllerapi.JobStatusQueryResponse;
+import com.linkedin.venice.controllerapi.SchemaResponse;
 import com.linkedin.venice.controllerapi.StorageEngineOverheadRatioResponse;
 import com.linkedin.venice.controllerapi.StoreResponse;
+import com.linkedin.venice.controllerapi.VersionCreationResponse;
+import com.linkedin.venice.message.KafkaKey;
 import com.linkedin.venice.meta.StoreInfo;
+import com.linkedin.venice.pushmonitor.ExecutionStatus;
+import com.linkedin.venice.status.protocol.PushJobDetails;
 import com.linkedin.venice.writer.VeniceWriter;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Optional;
 import java.util.Properties;
+import java.util.stream.Collectors;
+import org.apache.hadoop.mapred.Counters;
 import org.apache.hadoop.mapred.RunningJob;
+import org.mockito.ArgumentCaptor;
+import org.testng.Assert;
 import org.testng.annotations.Test;
 
+import static com.linkedin.venice.hadoop.MapReduceConstants.*;
 import static org.mockito.Mockito.*;
 
 
 public class TestKafkaPushJobWithReporterCounters {
 
+  private final String SCHEMA_STR = "{" +
+      "  \"namespace\" : \"example.avro\",  " +
+      "  \"type\": \"record\",   " +
+      "  \"name\": \"User\",     " +
+      "  \"fields\": [           " +
+      "       { \"name\": \"id\", \"type\": \"string\" },  " +
+      "       { \"name\": \"name\", \"type\": \"string\" },  " +
+      "       { \"name\": \"age\", \"type\": \"int\" },  " +
+      "       { \"name\": \"company\", \"type\": \"string\" }  " +
+      "  ] " +
+      " } ";
+
   @Test
-  public void testHandleErrorsInCounter() throws IOException {
+  public void testHandleQuotaExceeded() throws Exception {
+    testHandleErrorsInCounter(
+        Arrays.asList(
+            new MockCounterInfo(COUNTER_GROUP_QUOTA, COUNTER_TOTAL_VALUE_SIZE, 1001), // Quota exceeded
+            new MockCounterInfo(COUNTER_GROUP_KAFKA, AUTHORIZATION_FAILURES, 0),
+            new MockCounterInfo(COUNTER_GROUP_DATA_QUALITY, DUPLICATE_KEY_WITH_DISTINCT_VALUE, 0)
+        ),
+        Arrays.asList(
+            KafkaPushJob.PushJobCheckpoints.INITIALIZE_PUSH_JOB,
+            KafkaPushJob.PushJobCheckpoints.NEW_VERSION_CREATED,
+            KafkaPushJob.PushJobCheckpoints.QUOTA_EXCEEDED)
+    );
+  }
+
+  @Test
+  public void testHandleWriteAclFailed() throws Exception {
+    testHandleErrorsInCounter(
+        Arrays.asList(
+            new MockCounterInfo(COUNTER_GROUP_QUOTA, COUNTER_TOTAL_VALUE_SIZE, 1),
+            new MockCounterInfo(COUNTER_GROUP_KAFKA, AUTHORIZATION_FAILURES, 1), // Write ACL failed
+            new MockCounterInfo(COUNTER_GROUP_DATA_QUALITY, DUPLICATE_KEY_WITH_DISTINCT_VALUE, 0)
+        ),
+        Arrays.asList(
+            KafkaPushJob.PushJobCheckpoints.INITIALIZE_PUSH_JOB,
+            KafkaPushJob.PushJobCheckpoints.NEW_VERSION_CREATED,
+            KafkaPushJob.PushJobCheckpoints.WRITE_ACL_FAILED)
+    );
+  }
+
+  @Test
+  public void testHandleDuplicatedKeyWithDistinctValue() throws Exception {
+    testHandleErrorsInCounter(
+        Arrays.asList(
+            new MockCounterInfo(COUNTER_GROUP_QUOTA, COUNTER_TOTAL_VALUE_SIZE, 1),
+            new MockCounterInfo(COUNTER_GROUP_KAFKA, AUTHORIZATION_FAILURES, 0),
+            new MockCounterInfo(COUNTER_GROUP_DATA_QUALITY, DUPLICATE_KEY_WITH_DISTINCT_VALUE, 1)
+        ),
+        Arrays.asList(
+            KafkaPushJob.PushJobCheckpoints.INITIALIZE_PUSH_JOB,
+            KafkaPushJob.PushJobCheckpoints.NEW_VERSION_CREATED,
+            KafkaPushJob.PushJobCheckpoints.DUP_KEY_WITH_DIFF_VALUE)
+    );
+  }
+
+  private void testHandleErrorsInCounter(
+      List<MockCounterInfo> mockCounterInfos,
+      List<KafkaPushJob.PushJobCheckpoints> expectedCheckpoints
+  ) throws Exception {
     KafkaPushJob kafkaPushJob = new KafkaPushJob("job-id", getH2VProps());
     kafkaPushJob.setControllerClient(createControllerClientMock());
-    kafkaPushJob.setJobClientWrapper(createJobClientWrapperMock());
+    kafkaPushJob.setJobClientWrapper(createJobClientWrapperMock(mockCounterInfos));
     kafkaPushJob.setClusterDiscoveryControllerClient(createClusterDiscoveryControllerClientMock());
+    kafkaPushJob.setInputDataInfoProvider(getInputDataInfoProviderMock());
+    kafkaPushJob.setVeniceWriter(createVeniceWriterMock());
+
+    SentPushJobDetailsTrackerImpl pushJobDetailsTracker = new SentPushJobDetailsTrackerImpl();
+    kafkaPushJob.setSentPushJobDetailsTracker(pushJobDetailsTracker);
     kafkaPushJob.run();
+    List<Integer> actualCheckpointValues =
+        new ArrayList<>(pushJobDetailsTracker.getRecordedPushJobDetails().size());
+
+    for (PushJobDetails pushJobDetails : pushJobDetailsTracker.getRecordedPushJobDetails()) {
+      actualCheckpointValues.add(pushJobDetails.pushJobLatestCheckpoint);
+    }
+    List<Integer> expectedCheckpointValues =
+        expectedCheckpoints.stream().map(KafkaPushJob.PushJobCheckpoints::getValue).collect(Collectors.toList());
+
+    Assert.assertEquals(actualCheckpointValues, expectedCheckpointValues);
   }
 
   private Properties getH2VProps() {
@@ -40,8 +131,22 @@ public class TestKafkaPushJobWithReporterCounters {
     props.setProperty(KafkaPushJob.SSL_TRUST_STORE_PROPERTY_NAME,"test");
     props.setProperty(KafkaPushJob.SSL_KEY_STORE_PASSWORD_PROPERTY_NAME,"test");
     props.setProperty(KafkaPushJob.SSL_KEY_PASSWORD_PROPERTY_NAME,"test");
-    props.setProperty(KafkaPushJob.PUSH_JOB_STATUS_UPLOAD_ENABLE, "false");
+    props.setProperty(KafkaPushJob.PUSH_JOB_STATUS_UPLOAD_ENABLE, "true");
     return props;
+  }
+
+  private InputDataInfoProvider getInputDataInfoProviderMock() throws Exception {
+    InputDataInfoProvider inputDataInfoProvider = mock(InputDataInfoProvider.class);
+    KafkaPushJob.SchemaInfo schemaInfo = new KafkaPushJob.SchemaInfo();
+    schemaInfo.keySchemaString = SCHEMA_STR;
+    schemaInfo.valueSchemaString = SCHEMA_STR;
+    schemaInfo.keyField = "key-field";
+    schemaInfo.valueField = "value-field";
+    schemaInfo.fileSchemaString = "file-schema-string";
+    schemaInfo.fileSchemaString = "file-schema-string";
+    InputDataInfoProvider.InputDataInfo inputDataInfo = new InputDataInfoProvider.InputDataInfo(schemaInfo, 10L);
+    when(inputDataInfoProvider.validateInputAndGetSchema(anyString(), any())).thenReturn(inputDataInfo);
+    return inputDataInfoProvider;
   }
 
   private ControllerClient createClusterDiscoveryControllerClientMock() {
@@ -50,6 +155,16 @@ public class TestKafkaPushJobWithReporterCounters {
     when(controllerResponse.getCluster()).thenReturn("mock-cluster-name");
     when(controllerClient.discoverCluster(anyString())).thenReturn(controllerResponse);
     return controllerClient;
+  }
+
+  private JobStatusQueryResponse createJobStatusQueryResponseMock() {
+    JobStatusQueryResponse jobStatusQueryResponse = mock(JobStatusQueryResponse.class);
+    when(jobStatusQueryResponse.isError()).thenReturn(false);
+    when(jobStatusQueryResponse.getExtraInfo()).thenReturn(Collections.emptyMap());
+    when(jobStatusQueryResponse.getOptionalStatusDetails()).thenReturn(Optional.empty());
+    when(jobStatusQueryResponse.getOptionalExtraDetails()).thenReturn(Optional.empty());
+    when(jobStatusQueryResponse.getStatus()).thenReturn(ExecutionStatus.COMPLETED.toString());
+    return jobStatusQueryResponse;
   }
 
   private ControllerClient createControllerClientMock() {
@@ -65,16 +180,84 @@ public class TestKafkaPushJobWithReporterCounters {
     when(storeInfo.isSchemaAutoRegisterFromPushJobEnabled()).thenReturn(false);
     when(storeResponse.getStore()).thenReturn(storeInfo);
 
+    SchemaResponse keySchemaResponse = mock(SchemaResponse.class);
+    when(keySchemaResponse.isError()).thenReturn(false);
+    when(keySchemaResponse.getSchemaStr()).thenReturn(SCHEMA_STR);
+
+    SchemaResponse valueSchemaResponse = mock(SchemaResponse.class);
+    when(valueSchemaResponse.isError()).thenReturn(false);
+    when(valueSchemaResponse.getId()).thenReturn(12345);
+    VersionCreationResponse versionCreationResponse = createVersionCreationResponse();
+
     when(controllerClient.getStore(anyString())).thenReturn(storeResponse);
     when(controllerClient.getStorageEngineOverheadRatio(anyString())).thenReturn(storageEngineOverheadRatioResponse);
+    when(controllerClient.getKeySchema(anyString())).thenReturn(keySchemaResponse);
+    when(controllerClient.getValueSchemaID(anyString(), anyString())).thenReturn(valueSchemaResponse);
+    when(controllerClient.requestTopicForWrites(anyString(), anyLong(), any(),
+        anyString(), anyBoolean(), anyBoolean(), anyBoolean(), any(), any(), any())).thenReturn(versionCreationResponse);
 
+    JobStatusQueryResponse jobStatusQueryResponse = createJobStatusQueryResponseMock();
+    when(controllerClient.queryOverallJobStatus(anyString(), any())).thenReturn(jobStatusQueryResponse);
+
+    ControllerResponse controllerResponse = mock(ControllerResponse.class);
+    when(controllerResponse.isError()).thenReturn(false);
+    when(controllerClient.sendPushJobDetails(anyString(), anyInt(), any(byte[].class))).thenReturn(controllerResponse);
     return controllerClient;
   }
 
-  private JobClientWrapper createJobClientWrapperMock() throws IOException {
+  private VersionCreationResponse createVersionCreationResponse() {
+    VersionCreationResponse versionCreationResponse = mock(VersionCreationResponse.class);
+    when(versionCreationResponse.isError()).thenReturn(false);
+    when(versionCreationResponse.getKafkaTopic()).thenReturn("kafka-topic");
+    when(versionCreationResponse.getVersion()).thenReturn(1);
+    when(versionCreationResponse.getKafkaBootstrapServers()).thenReturn("kafka-bootstrap-server");
+    when(versionCreationResponse.getPartitions()).thenReturn(1);
+    when(versionCreationResponse.isEnableSSL()).thenReturn(false);
+    when(versionCreationResponse.getCompressionStrategy()).thenReturn(CompressionStrategy.NO_OP);
+    when(versionCreationResponse.isDaVinciPushStatusStoreEnabled()).thenReturn(false);
+    when(versionCreationResponse.getPartitionerClass()).thenReturn("PartitionerClass");
+    when(versionCreationResponse.getPartitionerParams()).thenReturn(Collections.emptyMap());
+    return versionCreationResponse;
+  }
+
+  private JobClientWrapper createJobClientWrapperMock(List<MockCounterInfo> mockCounterInfos) throws IOException {
     RunningJob runningJob = mock(RunningJob.class);
+    Counters counters = mock(Counters.class);
+
+    for (MockCounterInfo mockCounterInfo : mockCounterInfos) {
+      Counters.Group group = mock(Counters.Group.class);
+      when(group.getCounter(mockCounterInfo.getCounterName())).thenReturn(mockCounterInfo.getCounterValue());
+      when(counters.getGroup(mockCounterInfo.getGroupName())).thenReturn(group);
+    }
+    when(runningJob.getCounters()).thenReturn(counters);
     JobClientWrapper jobClientWrapper = mock(JobClientWrapper.class);
     when(jobClientWrapper.runJobWithConfig(any())).thenReturn(runningJob);
     return jobClientWrapper;
+  }
+
+  private VeniceWriter<KafkaKey, byte[], byte[]> createVeniceWriterMock() {
+    return mock(VeniceWriter.class);
+  }
+
+  private static class MockCounterInfo {
+    private final String groupName;
+    private final String counterName;
+    private final long counterValue;
+
+    MockCounterInfo(String groupName, String counterName, long counterValue) {
+      this.groupName = groupName;
+      this.counterName = counterName;
+      this.counterValue = counterValue;
+    }
+
+    String getGroupName() {
+      return groupName;
+    }
+    String getCounterName() {
+      return counterName;
+    }
+    long getCounterValue() {
+      return counterValue;
+    }
   }
 }
