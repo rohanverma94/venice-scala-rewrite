@@ -56,7 +56,7 @@ public class DefaultInputDataInfoProvider implements InputDataInfoProvider {
   private final KafkaPushJob.PushJobSetting pushJobSetting;
   private KafkaPushJob.ZstdConfig zstdConfig;
   private final VeniceProperties props;
-  private ExecutorService hdfsExecutorService;
+  private final ExecutorService hdfsExecutorService;
 
   DefaultInputDataInfoProvider(
       KafkaPushJob.StoreSetting storeSetting,
@@ -78,12 +78,12 @@ public class DefaultInputDataInfoProvider implements InputDataInfoProvider {
    * 3. Populate key schema, value schema;
    * 4. Load samples for dictionary compression if enabled
    * @param inputUri
-   * @param props push job properties
+   * @param veniceProps push job properties
    * @return a pair containing schema related information and input file size
    * @throws Exception
    */
   @Override
-  public InputDataInfo validateInputAndGetSchema(String inputUri, VeniceProperties props) throws Exception {
+  public InputDataInfo validateInputAndGetSchema(String inputUri, VeniceProperties veniceProps) throws Exception {
     Configuration conf = new Configuration();
     FileSystem fs = FileSystem.get(conf);
     Path srcPath = new Path(inputUri);
@@ -115,8 +115,8 @@ public class DefaultInputDataInfoProvider implements InputDataInfoProvider {
     final AtomicLong inputFileDataSize = new AtomicLong(0);
     if (schemaInfo.isAvro) {
       LOGGER.info("Detected Avro input format.");
-      schemaInfo.keyField = props.getString(KEY_FIELD_PROP);
-      schemaInfo.valueField = props.getString(VALUE_FIELD_PROP);
+      schemaInfo.keyField = veniceProps.getString(KEY_FIELD_PROP);
+      schemaInfo.valueField = veniceProps.getString(VALUE_FIELD_PROP);
 
       Pair<Schema, Schema> avroSchema = checkAvroSchemaConsistency(fs, fileStatuses, inputFileDataSize);
 
@@ -129,8 +129,8 @@ public class DefaultInputDataInfoProvider implements InputDataInfoProvider {
     } else {
       LOGGER.info("Detected Vson input format, will convert to Avro automatically.");
       //key / value fields are optional for Vson input
-      schemaInfo.keyField = props.getString(KEY_FIELD_PROP, "");
-      schemaInfo.valueField = props.getString(VALUE_FIELD_PROP, "");
+      schemaInfo.keyField = veniceProps.getString(KEY_FIELD_PROP, "");
+      schemaInfo.valueField = veniceProps.getString(VALUE_FIELD_PROP, "");
 
       Pair<VsonSchema, VsonSchema> vsonSchemaPair = checkVsonSchemaConsistency(fs, fileStatuses, inputFileDataSize);
 
