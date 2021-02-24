@@ -61,13 +61,11 @@ public class DefaultInputDataInfoProvider implements InputDataInfoProvider {
   DefaultInputDataInfoProvider(
       KafkaPushJob.StoreSetting storeSetting,
       KafkaPushJob.PushJobSetting pushJobSetting,
-      KafkaPushJob.ZstdConfig zstdConfig,
       VeniceProperties props,
       ExecutorService hdfsExecutorService
   ) {
     this.storeSetting = storeSetting;
     this.pushJobSetting = pushJobSetting;
-    this.zstdConfig = zstdConfig;
     this.props = props;
     this.hdfsExecutorService = hdfsExecutorService;
   }
@@ -264,6 +262,11 @@ public class DefaultInputDataInfoProvider implements InputDataInfoProvider {
     }
 
     LOGGER.info("Read " + fileSampleSize + " bytes to build dictionary. Reached EOF.");
+  }
+
+  @Override
+  public byte[] getZstdDictTrainSamples() {
+    return zstdConfig.zstdDictTrainer.trainSamples();
   }
 
   protected Schema extractAvroSubSchema(Schema origin, String fieldName) {

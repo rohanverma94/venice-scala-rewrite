@@ -82,7 +82,7 @@ public class TestKafkaPushJobWithReporterCounters {
         Arrays.asList(
             new MockCounterInfo(COUNTER_GROUP_QUOTA, COUNTER_TOTAL_VALUE_SIZE, 1),
             new MockCounterInfo(COUNTER_GROUP_KAFKA, AUTHORIZATION_FAILURES, 0),
-            new MockCounterInfo(COUNTER_GROUP_DATA_QUALITY, DUPLICATE_KEY_WITH_DISTINCT_VALUE, 1)
+            new MockCounterInfo(COUNTER_GROUP_DATA_QUALITY, DUPLICATE_KEY_WITH_DISTINCT_VALUE, 1) // Duplicated key with distinct value
         ),
         Arrays.asList(
             KafkaPushJob.PushJobCheckpoints.INITIALIZE_PUSH_JOB,
@@ -91,9 +91,26 @@ public class TestKafkaPushJobWithReporterCounters {
     );
   }
 
+  @Test
+  public void testHandleNoErrorInCounters() throws Exception { // Successful workflow
+    testHandleErrorsInCounter(
+        Arrays.asList(
+            new MockCounterInfo(COUNTER_GROUP_QUOTA, COUNTER_TOTAL_VALUE_SIZE, 1), // Quota not exceeded
+            new MockCounterInfo(COUNTER_GROUP_KAFKA, AUTHORIZATION_FAILURES, 0),   // No authorization error
+            new MockCounterInfo(COUNTER_GROUP_DATA_QUALITY, DUPLICATE_KEY_WITH_DISTINCT_VALUE, 0) // No duplicated key with distinct value
+        ),
+        Arrays.asList(
+            KafkaPushJob.PushJobCheckpoints.INITIALIZE_PUSH_JOB,
+            KafkaPushJob.PushJobCheckpoints.NEW_VERSION_CREATED,
+            KafkaPushJob.PushJobCheckpoints.MAP_REDUCE_JOB_COMPLETED,
+            KafkaPushJob.PushJobCheckpoints.JOB_STATUS_POLLING_COMPLETED
+        )
+    );
+  }
+
   private void testHandleErrorsInCounter(
       List<MockCounterInfo> mockCounterInfos,
-      List<KafkaPushJob.PushJobCheckpoints> expectedCheckpoints
+      List<KafkaPushJob.PushJobCheckpoints> expectedReportedCheckpoints
   ) throws Exception {
     KafkaPushJob kafkaPushJob = new KafkaPushJob("job-id", getH2VProps());
     kafkaPushJob.setControllerClient(createControllerClientMock());
@@ -105,16 +122,16 @@ public class TestKafkaPushJobWithReporterCounters {
     SentPushJobDetailsTrackerImpl pushJobDetailsTracker = new SentPushJobDetailsTrackerImpl();
     kafkaPushJob.setSentPushJobDetailsTracker(pushJobDetailsTracker);
     kafkaPushJob.run();
-    List<Integer> actualCheckpointValues =
+    List<Integer> actualReportedCheckpointValues =
         new ArrayList<>(pushJobDetailsTracker.getRecordedPushJobDetails().size());
 
     for (PushJobDetails pushJobDetails : pushJobDetailsTracker.getRecordedPushJobDetails()) {
-      actualCheckpointValues.add(pushJobDetails.pushJobLatestCheckpoint);
+      actualReportedCheckpointValues.add(pushJobDetails.pushJobLatestCheckpoint);
     }
     List<Integer> expectedCheckpointValues =
-        expectedCheckpoints.stream().map(KafkaPushJob.PushJobCheckpoints::getValue).collect(Collectors.toList());
+        expectedReportedCheckpoints.stream().map(KafkaPushJob.PushJobCheckpoints::getValue).collect(Collectors.toList());
 
-    Assert.assertEquals(actualCheckpointValues, expectedCheckpointValues);
+    Assert.assertEquals(actualReportedCheckpointValues, expectedCheckpointValues);
   }
 
   private Properties getH2VProps() {

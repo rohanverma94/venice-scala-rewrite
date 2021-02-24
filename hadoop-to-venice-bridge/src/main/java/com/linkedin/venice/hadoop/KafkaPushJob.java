@@ -30,7 +30,6 @@ import com.linkedin.venice.status.PushJobDetailsStatus;
 import com.linkedin.venice.status.protocol.PushJobDetails;
 import com.linkedin.venice.status.protocol.PushJobDetailsStatusTuple;
 import com.linkedin.venice.utils.EncodingUtils;
-import com.linkedin.venice.utils.Pair;
 import com.linkedin.venice.utils.PartitionUtils;
 import com.linkedin.venice.utils.SslUtils;
 import com.linkedin.venice.utils.Time;
@@ -364,8 +363,6 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
     int dictSize;
     int sampleSize;
   }
-
-  private ZstdConfig zstdConfig;
 
   public enum PushJobCheckpoints {
     INITIALIZE_PUSH_JOB(0),
@@ -703,7 +700,7 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
 
   private InputDataInfoProvider getInputDataInfoProvider() {
     if (inputDataInfoProvider == null) {
-      inputDataInfoProvider = new DefaultInputDataInfoProvider(storeSetting, pushJobSetting, zstdConfig, props, hdfsExecutorService);
+      inputDataInfoProvider = new DefaultInputDataInfoProvider(storeSetting, pushJobSetting, props, hdfsExecutorService);
     }
     return inputDataInfoProvider;
   }
@@ -728,7 +725,7 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
     ByteBuffer compressionDictionary = null;
     if (storeSetting.compressionStrategy == CompressionStrategy.ZSTD_WITH_DICT) {
       LOGGER.info("Training Zstd dictionary");
-      compressionDictionary = ByteBuffer.wrap(zstdConfig.zstdDictTrainer.trainSamples());
+      compressionDictionary = ByteBuffer.wrap(getInputDataInfoProvider().getZstdDictTrainSamples());
       LOGGER.info("Zstd dictionary size = " + compressionDictionary.limit() + " bytes");
     } else {
       LOGGER.info("No compression dictionary is generated with the strategy " + storeSetting.compressionStrategy);
@@ -1663,41 +1660,6 @@ public class KafkaPushJob extends AbstractJob implements AutoCloseable, Cloneabl
       LOGGER.info(String.format("Received exception while killing map-reduce job with name %s and ID %d",
           runningJob.getJobName(), runningJob.getID().getId()), ex);
     }
-  }
-
-  /**
-   * This function loads training samples from an Avro file for building the Zstd dictionary.
-   * @param recordReader The data accessor of input records.
-   */
-  protected void loadZstdTrainingSamples(AbstractVeniceRecordReader recordReader) {
-    int fileSampleSize = 0;
-    Iterator<Pair<byte[], byte[]>> it = recordReader.iterator();
-    while (it.hasNext()) {
-      Pair<byte[], byte[]> record = it.next();
-      if (record == null) {
-        continue;
-      }
-
-      byte[] data = record.getSecond();
-
-      if (data == null || data.length == 0) {
-        continue;
-      }
-
-      if (fileSampleSize + data.length > zstdConfig.maxBytesPerFile) {
-        LOGGER.info("Read " + fileSampleSize + " bytes to build dictionary. Reached limit per file.");
-        return;
-      }
-
-      // addSample returns false when the data read no longer fits in the 'sample' buffer limit
-      if (!zstdConfig.zstdDictTrainer.addSample(data)) {
-        LOGGER.info("Read " + fileSampleSize + " bytes to build dictionary. Reached maximum sample limit.");
-        return;
-      }
-      fileSampleSize += data.length;
-    }
-
-    LOGGER.info("Read " + fileSampleSize + " bytes to build dictionary. Reached EOF.");
   }
 
   /**
