@@ -1,6 +1,7 @@
 package com.linkedin.venice.utils;
 
 import com.github.luben.zstd.Zstd;
+import com.github.luben.zstd.ZstdDictTrainer;
 import com.linkedin.davinci.config.VeniceServerConfig;
 import com.linkedin.davinci.kafka.consumer.AggKafkaConsumerService;
 import com.linkedin.davinci.kafka.consumer.KafkaClusterBasedRecordThrottler;
@@ -13,8 +14,13 @@ import com.linkedin.davinci.stats.RocksDBMemoryStats;
 import com.linkedin.davinci.storage.StorageEngineRepository;
 import com.linkedin.davinci.storage.StorageMetadataService;
 import com.linkedin.venice.ConfigKeys;
+import com.linkedin.venice.compression.CompressionStrategy;
+import com.linkedin.venice.compression.GzipCompressor;
+import com.linkedin.venice.compression.NoopCompressor;
 import com.linkedin.venice.common.VeniceSystemStoreType;
 import com.linkedin.venice.compression.CompressionStrategy;
+import com.linkedin.venice.compression.VeniceCompressor;
+import com.linkedin.venice.compression.ZstdWithDictCompressor;
 import com.linkedin.venice.compression.CompressorFactory;
 import com.linkedin.venice.compression.VeniceCompressor;
 import com.linkedin.venice.controller.VeniceControllerConfig;
@@ -59,6 +65,7 @@ import com.linkedin.venice.offsets.OffsetRecord;
 import com.linkedin.venice.partitioner.DefaultVenicePartitioner;
 import com.linkedin.venice.partitioner.VenicePartitioner;
 import com.linkedin.venice.pushmonitor.ExecutionStatus;
+import com.linkedin.venice.serialization.DefaultSerializer;
 import com.linkedin.venice.serialization.avro.AvroProtocolDefinition;
 import com.linkedin.venice.serialization.avro.InternalAvroSpecificSerializer;
 import com.linkedin.venice.serialization.avro.VeniceAvroKafkaSerializer;
@@ -90,6 +97,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
+import java.util.function.Function;
 import java.util.stream.Stream;
 import org.apache.commons.io.IOUtils;
 import org.apache.helix.HelixManagerFactory;
@@ -111,7 +119,6 @@ import static com.linkedin.venice.ConfigKeys.*;
 import static com.linkedin.venice.utils.TestPushUtils.*;
 import static org.mockito.Mockito.*;
 import static org.testng.Assert.*;
-
 
 /**
  * General-purpose utility functions for tests.
@@ -255,6 +262,12 @@ public class TestUtils {
 
   public static void writeBatchData(VersionCreationResponse response, String keySchema, String valueSchema,
       Stream<Map.Entry> batchData, int valueSchemaId) throws Exception {
+    writeBatchData(response, keySchema, valueSchema, batchData, valueSchemaId, CompressionStrategy.NO_OP,
+        null);
+  }
+  public static void writeBatchData(VersionCreationResponse response, String keySchema, String valueSchema,
+      Stream<Map.Entry> batchData, int valueSchemaId, CompressionStrategy compressionStrategy,
+      Function<String,ByteBuffer> compressionDictionaryGenerator) throws Exception {
     Properties props = new Properties();
     props.put(KAFKA_BOOTSTRAP_SERVERS, response.getKafkaBootstrapServers());
     props.setProperty(PARTITIONER_CLASS, response.getPartitionerClass());
@@ -268,13 +281,58 @@ public class TestUtils {
         response.getPartitionerClass(),
         response.getAmplificationFactor(),
         new VeniceProperties(partitionerProperties));
-    try (VeniceWriter<Object, Object, byte[]> writer = writerFactory.createVeniceWriter(
-        response.getKafkaTopic(),
-        new VeniceAvroKafkaSerializer(keySchema),
-        new VeniceAvroKafkaSerializer(valueSchema),
-        response.getPartitions() * response.getAmplificationFactor(),
+
+    if ( compressionStrategy != CompressionStrategy.NO_OP) {
+      writeCompressed(writerFactory, keySchema, valueSchema, valueSchemaId, response.getKafkaTopic(),
+          response.getPartitions() * response.getAmplificationFactor(), venicePartitioner, batchData,
+          compressionStrategy, compressionDictionaryGenerator.apply(response.getKafkaTopic()));
+    } else {
+        writeUncompressed(writerFactory, keySchema, valueSchema, valueSchemaId, response.getKafkaTopic(),
+            response.getPartitions() * response.getAmplificationFactor(), venicePartitioner, batchData);
+    }
+  }
+
+  private static void writeCompressed(VeniceWriterFactory writerFactory, String keySchema, String valueSchema, int valueSchemaId, String kafkaTopic, int partitionCount, VenicePartitioner venicePartitioner,
+      Stream<Map.Entry> batchData, CompressionStrategy compressionStrategy, ByteBuffer compressionDictionary) throws Exception {
+    VeniceCompressor compressor = null;
+    if (compressionStrategy == CompressionStrategy.ZSTD_WITH_DICT) {
+      compressor = new ZstdWithDictCompressor(compressionDictionary.array(), 0);
+    } else if (compressionStrategy == CompressionStrategy.GZIP ){
+      compressor = new GzipCompressor();
+    } else {
+      compressor = new NoopCompressor();
+    }
+    try (VeniceWriter<byte[], byte[], byte[]> writer = writerFactory.createVeniceWriter(kafkaTopic, new DefaultSerializer(),
+        new DefaultSerializer(),
+        partitionCount,
         venicePartitioner)) {
-      writer.broadcastStartOfPush(Collections.emptyMap());
+        writer.broadcastStartOfPush(false, false, compressionStrategy,
+            Optional.ofNullable(compressionDictionary), Collections.emptyMap());
+      VeniceAvroKafkaSerializer keySerializer = new VeniceAvroKafkaSerializer(keySchema);
+      VeniceAvroKafkaSerializer valueSerializer = new VeniceAvroKafkaSerializer(valueSchema);
+      LinkedList<Future> putFutures = new LinkedList<>();
+      for (Map.Entry e : (Iterable<Map.Entry>) batchData::iterator) {
+        byte[] key = keySerializer.serialize(kafkaTopic,e.getKey());
+        byte[] value = valueSerializer.serialize(kafkaTopic,e.getValue());
+        value = compressor.compress(value);
+        putFutures.add(writer.put(key, value, valueSchemaId));
+      }
+      for (Future future: putFutures) {
+        future.get();
+      }
+      writer.broadcastEndOfPush(Collections.emptyMap());
+    }
+  }
+
+  private static void writeUncompressed(VeniceWriterFactory writerFactory, String keySchema, String valueSchema, int valueSchemaId, String kafkaTopic, int partitionCount, VenicePartitioner venicePartitioner,
+      Stream<Map.Entry> batchData) throws Exception {
+
+    try (VeniceWriter<Object, Object, byte[]> writer = writerFactory.createVeniceWriter(kafkaTopic, new VeniceAvroKafkaSerializer(keySchema),
+        new VeniceAvroKafkaSerializer(valueSchema),
+        partitionCount,
+        venicePartitioner)) {
+      writer.broadcastStartOfPush( Collections.emptyMap());
+
       LinkedList<Future> putFutures = new LinkedList<>();
       for (Map.Entry e : (Iterable<Map.Entry>) batchData::iterator) {
         putFutures.add(writer.put(e.getKey(), e.getValue(), valueSchemaId));
