@@ -374,7 +374,7 @@ public class ActiveActiveStoreIngestionTask extends LeaderFollowerStoreIngestion
           storageEngineRepository.getLocalStorageEngine(kafkaVersionTopic),
           getSubPartitionId(key, topic, partition), ByteBuffer.wrap(key), isChunkedTopic, null, null, null,
           storageMetadataService.getStoreVersionCompressionStrategy(kafkaVersionTopic),
-          serverConfig.isComputeFastAvroEnabled(), schemaRepository, storeName, compressorFactory, false);
+          serverConfig.isComputeFastAvroEnabled(), schemaRepository, storeName, compressorFactory, true);
       storeIngestionStats.recordIngestionValueBytesLookUpLatency(storeName,
           LatencyUtils.getLatencyInMS(lookupStartTimeInNS));
     } else {
