@@ -60,12 +60,11 @@ public class ReplicationMetadataRocksDBStoragePartition extends RocksDBStoragePa
         super.put(key, value);
         rocksDBSstFileWriter.put(key, ByteBuffer.wrap(metadata));
       } else {
-        try (WriteBatch writeBatch = new WriteBatch()) {
-          writeBatch.put(columnFamilyHandleList.get(DEFAULT_COLUMN_FAMILY_INDEX), key, value);
-          writeBatch.put(columnFamilyHandleList.get(REPLICATION_METADATA_COLUMN_FAMILY_INDEX), key,
-              metadata);
-          rocksDB.write(writeOptions, writeBatch);
-        }
+        WriteBatch writeBatch = new WriteBatch();
+        writeBatch.put(columnFamilyHandleList.get(DEFAULT_COLUMN_FAMILY_INDEX), key, value);
+        writeBatch.put(columnFamilyHandleList.get(REPLICATION_METADATA_COLUMN_FAMILY_INDEX), key,
+            metadata);
+        rocksDB.write(writeOptions, writeBatch);
       }
     } catch (RocksDBException e) {
         throw new VeniceException("Failed to put key/value pair to store: " + storeName + ", partition id: " + partitionId, e);
@@ -115,11 +114,10 @@ public class ReplicationMetadataRocksDBStoragePartition extends RocksDBStoragePa
         // Just update the RMD for deletion during repush
         rocksDBSstFileWriter.put(key, ByteBuffer.wrap(replicationMetadata));
       } else {
-        try (WriteBatch writeBatch = new WriteBatch()) {
-          writeBatch.delete(columnFamilyHandleList.get(DEFAULT_COLUMN_FAMILY_INDEX), key);
-          writeBatch.put(columnFamilyHandleList.get(REPLICATION_METADATA_COLUMN_FAMILY_INDEX), key, replicationMetadata);
-          rocksDB.write(writeOptions, writeBatch);
-        }
+        WriteBatch writeBatch = new WriteBatch();
+        writeBatch.delete(columnFamilyHandleList.get(DEFAULT_COLUMN_FAMILY_INDEX), key);
+        writeBatch.put(columnFamilyHandleList.get(REPLICATION_METADATA_COLUMN_FAMILY_INDEX), key, replicationMetadata);
+        rocksDB.write(writeOptions, writeBatch);
       }
     } catch (RocksDBException e) {
       String msg = deferredWrite ? "Failed to put metadata while deleing key for store: " + storeName + ", partition id: " + partitionId
